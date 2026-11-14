@@ -47,6 +47,8 @@
 #include <mutex>
 #include <string>
 #include <thread>
+
+#include "thread_name.h"
 #include <vector>
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
@@ -437,6 +439,7 @@ class Renderer {
     std::condition_variable cv;
     bool done = false;
     window_thread_ = std::thread([&, this] {
+      NameThread("gtav-window");
       const bool on = REXCVAR_GET(gtav_native) == "on";
       WNDCLASSEXW wc{sizeof(wc)};
       wc.lpfnWndProc = WndProc;
@@ -1178,6 +1181,7 @@ class Renderer {
 
    private:
     void Run() {
+      NameThread("gtav-submit");
       PinToBigCores();
 #if defined(__APPLE__)
       pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);  // keep it on the performance cores
@@ -1669,6 +1673,7 @@ class Renderer {
   }
 
   void ThreadMain() {
+    NameThread("gtav-record");
     PinToBigCores();
     linux_threads::Note(linux_threads::kRender);
 #if defined(__APPLE__)

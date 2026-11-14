@@ -38,6 +38,8 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+
+#include "thread_name.h"
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -499,7 +501,7 @@ class StreamConverter {
  public:
   explicit StreamConverter(int threads) {
     for (int i = 0; i < threads; i++)
-      workers_.emplace_back([this] {
+      workers_.emplace_back([this] { NameThread("gtav-convert");
 #ifdef __ANDROID__
         // Not the prime core (the game's main thread) nor the renderer's middle cluster.
         if (int n = int(sysconf(_SC_NPROCESSORS_CONF)); n >= 4) {
@@ -1230,6 +1232,7 @@ class PipelineWarmer {
   }
 
   void Worker() {
+    NameThread("gtav-pipeline");
     for (;;) {
       std::shared_ptr<Record> rec;
       {
@@ -1461,7 +1464,7 @@ class HashPool {
  public:
   explicit HashPool(int threads) {
     for (int i = 0; i < threads; i++)
-      workers_.emplace_back([this] {
+      workers_.emplace_back([this] { NameThread("gtav-hash");
 #ifdef _WIN32
         SetThreadDescription(GetCurrentThread(), L"Native hash");
 #elif defined(__ANDROID__)

@@ -1,6 +1,7 @@
 // gtav - guest physical page write tracking (see write_watch.h).
 
 #include "write_watch.h"
+#include "thread_name.h"
 
 #include <rex/cvar.h>
 #include <rex/kernel.h>
@@ -366,6 +367,7 @@ struct HarvestHelpers {
   void Start() {
     for (uint32_t i = 1; i < g_view_count; i++)
       threads.emplace_back([this, i] {
+        NameThread("gtav-harvest");
         uint32_t seen = 0;
         for (;;) {
           generation.wait(seen, std::memory_order_acquire);

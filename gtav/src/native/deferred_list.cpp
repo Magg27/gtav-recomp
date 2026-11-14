@@ -1,6 +1,7 @@
 // gtav - recording a frame on two threads (see deferred_list.h).
 
 #include "deferred_list.h"
+#include "thread_name.h"
 
 #include <rex/logging.h>
 
@@ -210,6 +211,7 @@ void DeferredCommandList::Wake() {
 }
 
 void DeferredCommandList::Run() {
+  NameThread("gtav-deferred");
   if (on_start_) on_start_();
   uint64_t done = 0;
   for (;;) {

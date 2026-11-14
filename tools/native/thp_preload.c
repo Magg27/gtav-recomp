@@ -5,7 +5,10 @@
 // on our own mappings ignores that setting ("never" is not "deny"). process_madvise from outside
 // needs CAP_SYS_NICE, hence this preload. THP_COLLAPSE_AT seconds after load (default 90) a thread
 // scans /proc/self/pagemap and collapses every 2 MB chunk of a guest view that is >= half present
-// (an empty chunk would become a zero-filled huge page). THP_LOG names the report file.
+// (an empty chunk would become a zero-filled huge page). THP_ALL_PHYS=1 collapses every chunk of the
+// physical views (file offset >= 4 GB: the 512 MB of guest physical memory is nearly all in use, and
+// the raw view's own PTEs say nothing about pages mapped through the other views of the same file).
+// THP_LOG names the report file.
 //   cc -shared -fPIC -O2 -o thp_preload.so thp_preload.c
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -42,6 +45,8 @@ static void* collapse_thread(void* arg) {
   time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm);
   fprintf(log, "thp_preload: collapse at %02d:%02d:%02d, ShmemPmdMapped %ld MB before\n", tm.tm_hour, tm.tm_min, tm.tm_sec,
           rollup("ShmemPmdMapped:") / 1024);
+  const char* all_phys_env = getenv("THP_ALL_PHYS");
+  int all_phys = all_phys_env && atoi(all_phys_env);
   FILE* maps = fopen("/proc/self/maps", "r");
   int pm = open("/proc/self/pagemap", O_RDONLY);
   if (!maps || pm < 0) { fprintf(log, "thp_preload: maps/pagemap unavailable\n"); fclose(log); return NULL; }
@@ -61,7 +66,7 @@ static void* collapse_thread(void* arg) {
       int present = 0;
       for (int i = 0; i < 512; i++) present += (ent[i] >> 63) & 1;
       present_mb += present * 4 / 1024;
-      if (present < 256) continue;
+      if (present < 256 && !(all_phys && off >= 0x100000000ul)) continue;
       chunks++;
       if (madvise((void*)a, CHUNK, MADV_COLLAPSE) == 0) ok++; else fail++;
     }
