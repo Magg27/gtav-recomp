@@ -4,6 +4,8 @@
 # is the bottleneck), the [native] timing lines, and (BENCH_PERF=1, needs
 # kernel.perf_event_paranoid <= 1) a perf profile in logs/NAME.perf.
 # usage: tools/native/bench.sh NAME [SECS] [game flags...]
+# The run-around script gets into cars, and --gtav_vehicle_30fps (default on: the 360's handling
+# pace) would then cap the run at 30 fps and count every frame as a hitch, so benches turn it off.
 NAME=$1; SECS=${2:-30}; [ $# -ge 2 ] && shift 2 || shift $#
 ROOT="$HOME/gtav-linux"
 L="$ROOT/logs/$NAME.log"
@@ -14,7 +16,7 @@ if pgrep -x gtav >/dev/null; then echo "game already running: not starting"; exi
 GO="$ROOT/logs/${NAME}_input.txt"
 rm -f "$L" "$GO"
 "$ROOT/play.sh" "$NAME" --gtav_native_fps --gtav_native_stats=true --gtav_native_hidden=true --audio_mute=true \
-  --input_script="$GO" "$@" >"$ROOT/logs/$NAME.stdout" 2>&1 &
+  --gtav_vehicle_30fps=false --input_script="$GO" "$@" >"$ROOT/logs/$NAME.stdout" 2>&1 &
 PID=$!
 S=$(date +%s)
 # Boot time counts only while the game disk (BENCH_DISK, default sdb) is not saturated by another
@@ -32,8 +34,13 @@ until grep -qE '\[native\] frame [0-9]+: [0-9]{3,} draws' "$L" 2>/dev/null; do
 done
 echo "in game after $(( $(date +%s) - S )) s (disk busy for ${busy_s} s of it)"
 sleep 10
-# BENCH_INPUT=none: stand still at the spawn point (steadier scenes for A/B runs).
-[ "${BENCH_INPUT:-run}" = none ] || cp "$ROOT/tools/native/input_run_around.txt" "$GO"
+# BENCH_INPUT=none: stand still at the spawn point (steadier scenes for A/B runs); a file path:
+# that input script (e.g. tools/native/input_stand_nudge.txt keeps the idle camera from panning).
+case "${BENCH_INPUT:-run}" in
+  none) ;;
+  run) cp "$ROOT/tools/native/input_run_around.txt" "$GO" ;;
+  *) cp "$BENCH_INPUT" "$GO" ;;
+esac
 sleep 5
 # Per-thread CPU (utime + stime ticks) over the window, and the CPU the thread last ran on
 # (P-cores 0-7 in hyperthread pairs, E-cores 8-11 on this laptop).
