@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # bin_ab_linux.sh NAME BIN_A BIN_B [ROUNDS=3] [SECS=60] [game flags...]
 # Two-binary A/B of the SDK runtime on Linux: alternates the game binaries BIN_A and BIN_B (paths
 # copied over build/gtav/gtav while the game is NOT running), runs
@@ -19,8 +19,21 @@ while [ $i -lt "$ROUNDS" ]; do
     [ $side = A ] && d=$A || d=$B
     run="${N}_${side}${i}"
     pgrep -x gtav >/dev/null && { echo "game still running before $run"; break 2; }
-    cp -p "$d" "$G/gtav"
-    "$ROOT/tools/native/bench.sh" "$run" "$SECS" "$@" >"$ROOT/logs/$run.bench" 2>&1
+    # Each run waits for a quiet machine (another session's GPU render may have started since the
+    # last one) and is redone when something else used the GPU during its window or the game
+    # never reached the world; the spoiled attempt's log is kept as NAME.dirtyK.log.
+    try=0
+    while :; do
+      "$ROOT/tools/native/quiet_gate.sh" "${BENCH_GATE_LOAD:-5}" "${BENCH_GATE_SECS:-21600}" "${BENCH_DISK:-sdb}" >&2 || { echo "machine not quiet: giving up before $run" >&2; break 3; }
+      cp -p "$d" "$G/gtav"
+      "$ROOT/tools/native/bench.sh" "$run" "$SECS" "$@" >"$ROOT/logs/$run.bench" 2>&1; rc=$?
+      gpuc=$(cat "$ROOT/logs/$run.gpuc" 2>/dev/null || echo 0)
+      [ $rc = 0 ] && [ "$gpuc" = 0 ] && break
+      try=$((try + 1)); echo "$run spoiled (rc $rc, gpu contention $gpuc samples): attempt $try" >&2
+      for f in "$ROOT/logs/$run".*; do mv "$f" "${f/$run./$run.dirty$try.}"; done 2>/dev/null
+      [ $try -ge "${BENCH_RETRIES:-3}" ] && { echo "$run: giving up after $try spoiled attempts" >&2; break 3; }
+      sleep 10
+    done
     python3 "$ROOT/tools/native/bench_stats.py" "$ROOT/logs/$run.log" "$ROOT/logs/${run}_cpu0.txt" "$ROOT/logs/${run}_cpu1.txt" "$SECS" --csv | sed "s/^/$side,/"
     sleep 3
   done

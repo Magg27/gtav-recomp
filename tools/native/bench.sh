@@ -49,12 +49,22 @@ snap() { for t in /proc/$PID/task/*; do
   printf '%s %s ' "${t##*/}" "$(tr ' ' '_' <"$t/comm")"; sed 's/.*) //' "$t/stat" | awk '{print $12 + $13, $37}'; done; }
 snap >"$ROOT/logs/${NAME}_cpu0.txt"
 LINE0=$(wc -l <"$L")
+# Another process on the GPU during the window (a Blender render from another session) makes the
+# run worthless: sampled every 5 s into logs/NAME_gpu.txt, counted in logs/NAME.gpuc and the
+# summary ("gpu contention: N of M samples"); bin_ab_linux.sh redoes such runs.
+GPUF="$ROOT/logs/${NAME}_gpu.txt"; : >"$GPUF"
+( while kill -0 $PID 2>/dev/null; do
+    o=$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null | grep -v '/gtav' | awk -F', ' '{print $2}' | xargs -rn1 basename 2>/dev/null | sort -u | tr '\n' ',')
+    echo "$(date +%H:%M:%S) ${o:-none}" >>"$GPUF"; sleep 5; done ) & GPUW=$!
 if [ "${BENCH_PERF:-0}" = 1 ]; then
   perf record -F 499 ${BENCH_PERF_ARGS:--g} -p $PID -o "$ROOT/logs/$NAME.perf" -- sleep "$SECS" >/dev/null 2>&1
 else
   sleep "$SECS"
 fi
 snap >"$ROOT/logs/${NAME}_cpu1.txt"
+kill $GPUW 2>/dev/null; wait $GPUW 2>/dev/null
+GPUC=$(grep -vc 'none$' "$GPUF"); echo "$GPUC" >"$ROOT/logs/$NAME.gpuc"
+echo "gpu contention: $GPUC of $(wc -l <"$GPUF") samples$( [ "$GPUC" -gt 0 ] && echo " ($(grep -v 'none$' "$GPUF" | awk '{print $2}' | sort -u | tr '\n' ' '))")"
 kill -9 $PID 2>/dev/null
 sleep 2
 HZ=$(getconf CLK_TCK)
