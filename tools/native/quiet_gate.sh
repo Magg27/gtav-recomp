@@ -9,7 +9,10 @@ MAXLOAD=${1:-5}; MAXSECS=${2:-21600}; DISK=${3:-sdb}
 S0=$(date +%s); ok=0
 while :; do
   l=$(cut -d' ' -f1 /proc/loadavg | cut -d. -f1)
-  gpu=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1)
+  # Two samples, lowest wins: the first query after the GPU idled to P8 reports ~22% (the wake-up
+  # itself), which held the gate shut for an hour on 11-15 with nothing running.
+  gpu=$( { nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1; sleep 1
+          nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1; } | sort -n | head -1)
   apps=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c .)
   a=$(awk -v d="$DISK" '$3==d{print $13}' /proc/diskstats); sleep 10; b=$(awk -v d="$DISK" '$3==d{print $13}' /proc/diskstats)
   disk=$(( (${b:-0} - ${a:-0}) / 100 ))  # percent of the 10 s the disk had a request in flight
