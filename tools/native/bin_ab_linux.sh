@@ -27,10 +27,12 @@ while [ $i -lt "$ROUNDS" ]; do
       "$ROOT/tools/native/quiet_gate.sh" "${BENCH_GATE_LOAD:-5}" "${BENCH_GATE_SECS:-21600}" "${BENCH_DISK:-sdb}" >&2 || { echo "machine not quiet: giving up before $run" >&2; break 3; }
       cp -p "$d" "$G/gtav"
       "$ROOT/tools/native/bench.sh" "$run" "$SECS" "$@" >"$ROOT/logs/$run.bench" 2>&1; rc=$?
-      gpuc=$(cat "$ROOT/logs/$run.gpuc" 2>/dev/null || echo 0)
-      [ $rc = 0 ] && [ "$gpuc" = 0 ] && break
-      try=$((try + 1)); echo "$run spoiled (rc $rc, gpu contention $gpuc samples): attempt $try" >&2
-      for f in "$ROOT/logs/$run".*; do mv "$f" "${f/$run./$run.dirty$try.}"; done 2>/dev/null
+      gpuc=$(cat "$ROOT/logs/$run.gpuc" 2>/dev/null || echo 0); gput=$(wc -l <"$ROOT/logs/${run}_gpu.txt" 2>/dev/null || echo 1)
+      # ab_fit.py drops the contaminated seconds of a run; only a run that lost more than
+      # BENCH_DIRTY_PCT (40) percent of its window is redone.
+      [ $rc = 0 ] && [ $((gpuc * 100)) -le $((gput * ${BENCH_DIRTY_PCT:-40})) ] && break
+      try=$((try + 1)); echo "$run spoiled (rc $rc, gpu contention $gpuc of $gput samples): attempt $try" >&2
+      for f in "$ROOT/logs/$run".* "$ROOT/logs/${run}_"*; do case "$f" in *.dirty*|*_gpuwatch*) ;; *) mv "$f" "${f/$run/$run.dirty$try}";; esac; done 2>/dev/null
       [ $try -ge "${BENCH_RETRIES:-3}" ] && { echo "$run: giving up after $try spoiled attempts" >&2; break 3; }
       sleep 10
     done

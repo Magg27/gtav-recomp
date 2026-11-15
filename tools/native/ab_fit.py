@@ -22,12 +22,32 @@ def fit(pts):
     b = (n * sxy - sx * sy) / d; a = (sy - b * sx) / n
     res = sum((p[1] - a - b * p[0]) ** 2 for p in pts) / max(n - 2, 1)
     return a, b, res ** 0.5
+import os
+def contaminated(log):
+    """Seconds (HH:MM:SS as seconds of day) when bench.sh saw another process on the GPU
+    (<log>_gpu.txt, one sample per 5 s): the per-second lines within 10 s before / 5 s after
+    such a sample are dropped (another session's Blender render stalls the guest on fences)."""
+    bad = set()
+    try:
+        for line in open(re.sub(r'\.log$', '', log) + '_gpu.txt'):
+            t, what = line.split(None, 1)
+            if what.strip() == 'none': continue
+            h, m, s = (int(x) for x in t.split(':')); c = h * 3600 + m * 60 + s
+            bad.update(range(c - 10, c + 6))
+    except OSError: pass
+    return bad
+tpat = re.compile(r'^\[\d{4}-\d\d-\d\d (\d\d):(\d\d):(\d\d)')
 for arg in args:
     side, log = arg.split(':', 1)
-    pts = []
+    pts = []; bad = contaminated(log); dropped = 0
     for line in open(log, errors='replace'):
         m = pat.search(line)
-        if m: pts.append((int(m.group(3)), float(m.group(2))))
+        if not m: continue
+        t = tpat.match(line)
+        if t and bad and (int(t.group(1)) * 3600 + int(t.group(2)) * 60 + int(t.group(3))) in bad:
+            dropped += 1; continue
+        pts.append((int(m.group(3)), float(m.group(2))))
+    if dropped: print(f"{side} {log}: {dropped} s dropped (another process on the GPU)")
     first = next((i for i, p in enumerate(pts) if p[0] >= 300), len(pts))
     pts = pts[first + skip:]
     f = fit(pts)
