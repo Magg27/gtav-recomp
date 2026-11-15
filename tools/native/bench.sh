@@ -15,6 +15,15 @@ export GTAV_IGNORE_SETTINGS=1
 if pgrep -x gtav >/dev/null; then echo "game already running: not starting"; exit 1; fi
 GO="$ROOT/logs/${NAME}_input.txt"
 rm -f "$L" "$GO"
+# Hold 1 GiB of GPU memory from before the boot until the game exits (BENCH_GPU_HOLD=0 to skip):
+# another session's render queue starts a Blender render whenever the GPU has under 700 MiB in
+# use, and the game's first boot seconds left that door open (11-15: most windows spoiled).
+HOLD=""
+if [ "${BENCH_GPU_HOLD:-1}" != 0 ]; then
+  python3 "$ROOT/tools/native/gpu_hold.py" 1024 >"$ROOT/logs/${NAME}_hold.txt" 2>&1 & HOLD=$!
+  for i in 1 2 3 4 5 6 7 8 9 10; do grep -q held "$ROOT/logs/${NAME}_hold.txt" 2>/dev/null && break; sleep 1; done
+fi
+unhold() { [ -n "$HOLD" ] && kill "$HOLD" 2>/dev/null; }
 "$ROOT/play.sh" "$NAME" --gtav_native_fps --gtav_native_stats=true --gtav_native_hidden=true --audio_mute=true \
   --gtav_vehicle_30fps=false --input_script="$GO" "$@" >"$ROOT/logs/$NAME.stdout" 2>&1 &
 PID=$!
@@ -27,10 +36,10 @@ dticks() { awk -v d="$DISK" '$3 == d { print $13 }' /proc/diskstats; }
 t0=$(dticks)
 until grep -qE '\[native\] frame [0-9]+: [0-9]{3,} draws' "$L" 2>/dev/null; do
   sleep 5
-  if ! kill -0 $PID 2>/dev/null; then echo "game exited before reaching the world"; exit 3; fi
+  if ! kill -0 $PID 2>/dev/null; then echo "game exited before reaching the world"; unhold; exit 3; fi
   t1=$(dticks); if [ -n "$t1" ] && [ $(( (t1 - t0) / 50 )) -gt 40 ]; then busy_s=$((busy_s + 5)); else waited=$((waited + 5)); fi; t0=$t1
   if [ "$waited" -gt "${BENCH_BOOT_SECS:-420}" ] || [ $(( $(date +%s) - S )) -gt $(( 3 * ${BENCH_BOOT_SECS:-420} )) ]; then
-    echo "no in-game frame after $(( $(date +%s) - S )) s (boot hang? disk busy for ${busy_s} s of it)"; kill -9 $PID; exit 2; fi
+    echo "no in-game frame after $(( $(date +%s) - S )) s (boot hang? disk busy for ${busy_s} s of it)"; kill -9 $PID; unhold; exit 2; fi
 done
 echo "in game after $(( $(date +%s) - S )) s (disk busy for ${busy_s} s of it)"
 sleep 10
@@ -54,7 +63,7 @@ LINE0=$(wc -l <"$L")
 # summary ("gpu contention: N of M samples"); bin_ab_linux.sh redoes such runs.
 GPUF="$ROOT/logs/${NAME}_gpu.txt"; : >"$GPUF"
 ( while kill -0 $PID 2>/dev/null; do
-    o=$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null | grep -v '/gtav' | awk -F', ' '{print $2}' | xargs -rn1 basename 2>/dev/null | sort -u | tr '\n' ',')
+    o=$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null | grep -v '/gtav' | grep -v "^$HOLD, " | awk -F', ' '{print $2}' | xargs -rn1 basename 2>/dev/null | sort -u | tr '\n' ',')
     echo "$(date +%H:%M:%S) ${o:-none}" >>"$GPUF"; sleep 5; done ) & GPUW=$!
 if [ "${BENCH_PERF:-0}" = 1 ]; then
   perf record -F 499 ${BENCH_PERF_ARGS:--g} -p $PID -o "$ROOT/logs/$NAME.perf" -- sleep "$SECS" >/dev/null 2>&1
@@ -66,6 +75,7 @@ kill $GPUW 2>/dev/null; wait $GPUW 2>/dev/null
 GPUC=$(grep -vc 'none$' "$GPUF"); echo "$GPUC" >"$ROOT/logs/$NAME.gpuc"
 echo "gpu contention: $GPUC of $(wc -l <"$GPUF") samples$( [ "$GPUC" -gt 0 ] && echo " ($(grep -v 'none$' "$GPUF" | awk '{print $2}' | sort -u | tr '\n' ' '))")"
 kill -9 $PID 2>/dev/null
+unhold
 sleep 2
 HZ=$(getconf CLK_TCK)
 echo "== CPU per thread over $SECS s (% of one core, top 12)"
