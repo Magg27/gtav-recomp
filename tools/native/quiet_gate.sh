@@ -13,7 +13,10 @@ while :; do
   # itself), which held the gate shut for an hour on 11-15 with nothing running.
   gpu=$( { nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1; sleep 1
           nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1; } | sort -n | head -1)
-  apps=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c .)
+  # GATE_IGNORE_PID: the caller's own gpu_hold.py. A Blender that is still loading its scene on the
+  # CPU is not on the GPU yet but will be within a minute: not quiet either.
+  apps=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -vx "${GATE_IGNORE_PID:-none}" | grep -c .)
+  pgrep -x blender >/dev/null && apps=$((apps + 1))
   a=$(awk -v d="$DISK" '$3==d{print $13}' /proc/diskstats); sleep 10; b=$(awk -v d="$DISK" '$3==d{print $13}' /proc/diskstats)
   disk=$(( (${b:-0} - ${a:-0}) / 100 ))  # percent of the 10 s the disk had a request in flight
   if [ "$l" -lt "$MAXLOAD" ] && [ "${gpu:-0}" -lt 20 ] && [ "$apps" = 0 ] && [ "$disk" -lt 15 ]; then ok=$((ok+1)); else ok=0; fi

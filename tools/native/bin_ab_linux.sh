@@ -24,9 +24,17 @@ while [ $i -lt "$ROUNDS" ]; do
     # never reached the world; the spoiled attempt's log is kept as NAME.dirtyK.log.
     try=0
     while :; do
-      "$ROOT/tools/native/quiet_gate.sh" "${BENCH_GATE_LOAD:-5}" "${BENCH_GATE_SECS:-21600}" "${BENCH_DISK:-sdb}" >&2 || { echo "machine not quiet: giving up before $run" >&2; break 3; }
+      # The GPU memory is held before the gate: another session's render queue (nts-cycles
+      # gen_frames.sh) starts a render whenever under 700 MiB is in use, so a hold taken after the
+      # gate lost the race to its 30 s poll. With the hold up first, a render in flight finishes,
+      # the queue then waits, the gate sees a free GPU and the run gets it; the hold is released
+      # after each run so the queue gets a render in between.
+      python3 "$ROOT/tools/native/gpu_hold.py" 1024 >"$ROOT/logs/${run}_hold.txt" 2>&1 & HOLD=$!
+      for w in 1 2 3 4 5 6 7 8 9 10; do grep -q held "$ROOT/logs/${run}_hold.txt" 2>/dev/null && break; sleep 1; done
+      GATE_IGNORE_PID=$HOLD "$ROOT/tools/native/quiet_gate.sh" "${BENCH_GATE_LOAD:-5}" "${BENCH_GATE_SECS:-21600}" "${BENCH_DISK:-sdb}" >&2 || { kill $HOLD; echo "machine not quiet: giving up before $run" >&2; break 3; }
       cp -p "$d" "$G/gtav"
-      "$ROOT/tools/native/bench.sh" "$run" "$SECS" "$@" >"$ROOT/logs/$run.bench" 2>&1; rc=$?
+      BENCH_GPU_HOLD=0 "$ROOT/tools/native/bench.sh" "$run" "$SECS" "$@" >"$ROOT/logs/$run.bench" 2>&1; rc=$?
+      kill $HOLD 2>/dev/null; wait $HOLD 2>/dev/null
       gpuc=$(cat "$ROOT/logs/$run.gpuc" 2>/dev/null || echo 0); gput=$(wc -l <"$ROOT/logs/${run}_gpu.txt" 2>/dev/null || echo 1)
       # ab_fit.py drops the contaminated seconds of a run; only a run that lost more than
       # BENCH_DIRTY_PCT (40) percent of its window is redone.
