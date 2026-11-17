@@ -6,6 +6,9 @@
 # game disk made every loader read take 60-120 ms (10-second loading frames). The disk (DISK,
 # default sdb) must also be under 15% busy. usage: quiet_gate.sh [MAXLOAD] [MAXSECS] [DISK]
 MAXLOAD=${1:-5}; MAXSECS=${2:-21600}; DISK=${3:-sdb}
+# logs/gate_maxload overrides MAXLOAD while a chain is already running (owner 11-16: run the A/B
+# sides under the same load instead of waiting for a quiet CPU; ABBA order cancels the shared load).
+F="$(dirname "$0")/../../logs/gate_maxload"; [ -f "$F" ] && MAXLOAD=$(cat "$F")
 S0=$(date +%s); ok=0
 while :; do
   l=$(cut -d' ' -f1 /proc/loadavg | cut -d. -f1)
