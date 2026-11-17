@@ -1719,6 +1719,9 @@ struct Backend::Impl {
     return it == resolved_latest.end() ? nullptr : &resolved[it->second];
   }
   std::unordered_map<uint64_t, CachedTexture> textures;
+  // Direct-mapped memo in front of `textures` (its map find was ~2% of the render thread at ~1,400
+  // lookups a frame); cleared by the two eviction paths, the only places that erase entries.
+  std::array<std::pair<uint64_t, CachedTexture*>, 16384> texture_memo{};
   // Running byte totals of `textures` (t.bytes) and `buffers` (b.size): the budget check used to walk
   // both maps every 60 frames (169,000 buffers after an hour of driving = a periodic hitch).
   // Re-summed every 600 frames in case an update path was missed.
@@ -1727,8 +1730,9 @@ struct Backend::Impl {
   std::vector<std::unique_ptr<RenderSampler>> sampler_objects;
   // Erased only by the buffer budget (EvictTexturesOverBudget), which then clears buffer_memo.
   std::unordered_map<uint64_t, CachedBuffer> buffers;
-  // Direct-mapped memo in front of `buffers` (~4,000 lookups a frame were 6% of the render thread).
-  std::array<std::pair<uint64_t, CachedBuffer*>, 4096> buffer_memo{};
+  // Direct-mapped memo in front of `buffers` (~4,000 lookups a frame were 6% of the render thread;
+  // 16K entries: with 4K the misses' map finds were still 3% on 11-15).
+  std::array<std::pair<uint64_t, CachedBuffer*>, 16384> buffer_memo{};
   // PreHash: full hashes taken this frame (hashed ahead next frame) and the ones for this frame.
   std::vector<PreHashItem> prehash_next, prehash_now;
   std::unique_ptr<HashPool> hash_pool;  // after the vectors: destroyed (and finished) first
@@ -2381,6 +2385,7 @@ struct Backend::Impl {
       textures.erase(it);
       released++;
     }
+    if (released) texture_memo.fill({});
     textures_evicted += released;
     if (budget_logs++ < 20 || budget_logs % 100 == 0)
       REXLOG_INFO("[native] texture budget: released {} textures ({:.0f} MB), {} cached ({:.0f} MB)", released,
@@ -2412,6 +2417,7 @@ struct Backend::Impl {
       textures.erase(it);
       released++;
     }
+    if (released) texture_memo.fill({});
     textures_evicted += released;
     REXLOG_INFO("[native] texture cache: {} free descriptors left, released {} textures idle for {}+ frames "
                 "({} descriptors back after this frame; {} released so far, {} cached)",
@@ -2701,15 +2707,24 @@ struct Backend::Impl {
     return blit_vs && blit_ps && rectlist_gs && depth_copy_pipeline;
   }
 
+  // Direct-mapped memo in front of `samplers` (the find was 3% of the render thread, 11-15 profile:
+  // ~1,400 slot lookups a frame, a few dozen distinct samplers).
+  std::array<std::pair<uint64_t, uint32_t>, 256> sampler_memo{};
   uint32_t Sampler(const RenderSamplerDesc& desc) {
     uint64_t h = Hash(&desc, sizeof(desc));
+    auto& memo = sampler_memo[(h >> 40) & (sampler_memo.size() - 1)];
+    if (memo.first == h && h) return memo.second;
     auto it = samplers.find(h);
-    if (it != samplers.end()) return it->second;
+    if (it != samplers.end()) {
+      memo = {h, it->second};
+      return it->second;
+    }
     uint32_t index = uint32_t(sampler_objects.size());
     if (index >= kSamplerDescriptors) return 0;
     sampler_objects.push_back(device->createSampler(desc));
     sampler_set->setSampler(index, sampler_objects.back().get());
     samplers[h] = index;
+    memo = {h, index};
     return index;
   }
 
@@ -2997,7 +3012,9 @@ struct Backend::Impl {
       return r->descriptor;
     }
     uint64_t key = Hash(words, 24);
-    auto& t = textures[key];
+    auto& tmemo = texture_memo[(key ^ (key >> 29)) & (texture_memo.size() - 1)];
+    if (tmemo.first != key || !tmemo.second) tmemo = {key, &textures[key]};
+    auto& t = *tmemo.second;
     t.used_frame = frame;
     tprof.lookups++;
     if (t.failed) return dim == 2 ? kNull3D : kNull2D;
@@ -3782,8 +3799,10 @@ struct Backend::Impl {
     ds.index = view;
     ds.index_bound = true;
   }
+  struct BlockMemo;
   struct FetchCache {
-    std::array<uint32_t, 192> sc{};  // shared constants 0-191: descriptors, samplers, exp scales
+    const BlockMemo* bm = nullptr;  // the block memo entry holding this block's slots (sc 0-191)
+    uint64_t hash = 0;              // its hash when stored: a reused entry no longer matches
     uint32_t offset = 0;
     bool valid = false;
   } fetch_cache;
@@ -3810,6 +3829,7 @@ struct Backend::Impl {
   std::vector<SlotMemo> slot_memo = std::vector<SlotMemo>(kSlotMemoSize);
   uint32_t slot_generation = 1;
   uint64_t slot_memo_hits = 0;
+  uint64_t stat_pipeline_binds = 0;  // vkCmdBindPipeline calls (5% of the render thread in the driver, 11-15)
   uint32_t prof_frames = 0;
   uint64_t tstats_watched_buffers = 0, watch_missed = 0, watch_late = 0;
 
@@ -3826,7 +3846,8 @@ struct Backend::Impl {
   // consecutive draws: reuse the previous draw's upload when the 1,792 bytes match (a memcmp is
   // far cheaper than writing them to write-combined memory again, ~7 MB a frame at 3,600 draws).
   struct LastShared {
-    alignas(16) uint8_t cpu[kSharedConstantsSize];
+    alignas(16) uint8_t cpu[2][kSharedConstantsSize];  // [cur]: the last upload; a draw builds into the other
+    uint32_t cur = 0;
     UploadAllocation gpu{};
     bool valid = false;
   } last_shared;
@@ -3837,9 +3858,7 @@ struct Backend::Impl {
                                                     LastConstants& last) {
     if (last.valid && last.offset == offset && (last.use == use || !last.use)) return last.gpu;
     auto a = upload.Allocate(kAluSize);
-    auto run = [&](uint32_t first, uint32_t count) {
-      for (uint32_t i = first * 16; i < (first + count) * 16; i += 16) Swap16Bytes(a.cpu + i, src + i, 4);
-    };
+    auto run = [&](uint32_t first, uint32_t count) { SwapWords(a.cpu + first * 16, src + first * 16, count * 16); };
     if (use)
       for (const auto& r : use->runs) run(r.first, r.count);
     else
@@ -4209,17 +4228,20 @@ struct Backend::Impl {
                      psc = ConstantUpload(psrc, d.ps_consts, dumping ? nullptr : d.ps_use, last_ps);
     // Shared constants are built here and copied into upload memory once: that memory is
     // write-combined, and reading it back (or scattering 4-byte writes) cost ~100 ms a frame.
-    alignas(16) uint8_t shared_cpu[kSharedConstantsSize] = {};
+    uint8_t* shared_cpu = last_shared.cpu[last_shared.cur ^ 1];
+    std::memset(shared_cpu, 0, kSharedConstantsSize);
     prof.Mark(prof.consts);
     uint32_t* sc = reinterpret_cast<uint32_t*>(shared_cpu);
     const uint8_t* fetch = f.At(d.fetch);
     texture_log.clear();
     // The texture/sampler descriptors of a fetch block only change at a resolve (new resolve
     // textures, layouts): a draw sharing the previous draw's block reuses its slots.
-    bool fetch_cached = !dumping && fetch_cache.valid && fetch_cache.offset == d.fetch;
-    if (fetch_cached) std::memcpy(sc, fetch_cache.sc.data(), sizeof(fetch_cache.sc));
+    bool fetch_cached = !dumping && fetch_cache.valid && fetch_cache.offset == d.fetch &&
+                        fetch_cache.bm->hash == fetch_cache.hash && fetch_cache.bm->generation == slot_generation;
+    if (fetch_cached) std::memcpy(sc, fetch_cache.bm->sc.data(), sizeof(fetch_cache.bm->sc));
     tprof.cached_blocks += fetch_cached;
-    BlockMemo* bm = nullptr;
+    BlockMemo* bm = nullptr;      // the entry to fill (a block memo miss)
+    BlockMemo* bm_hit = nullptr;  // the entry this draw's slots came from or went to
     if (!fetch_cached && !dumping) {
       uint64_t h = Hash(fetch, 768);
       bm = &block_memo[h & (kBlockMemoSize - 1)];
@@ -4227,6 +4249,7 @@ struct Backend::Impl {
         std::memcpy(sc, bm->sc.data(), sizeof(bm->sc));
         block_memo_hits++;
         fetch_cached = true;
+        bm_hit = bm;
         bm = nullptr;
       } else {
         bm->hash = h;
@@ -4327,16 +4350,14 @@ struct Backend::Impl {
     if (!fetch_cached && prof.on)
       tprof.descriptor_ms +=
           8 * std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - slots_start).count();
-    if (!dumping && (!fetch_cached || bm == nullptr)) {
-      std::memcpy(fetch_cache.sc.data(), sc, sizeof(fetch_cache.sc));
-      fetch_cache.offset = d.fetch;
-      fetch_cache.valid = true;
-    }
     if (bm) {  // a block memo miss: remember this block's words
       std::memcpy(bm->sc.data(), sc, sizeof(bm->sc));
       std::memcpy(bm->block.data(), fetch, 768);
       bm->generation = slot_generation;
+      bm_hit = bm;
     }
+    // The next draw with the same fetch offset takes its slots from that entry (no copy of its own).
+    if (bm_hit) fetch_cache = {bm_hit, bm_hit->hash, d.fetch, true};
     prof.Mark(prof.fetch);
     const uint8_t* bools = r;  // the shadow starts with the 0x4900 bool constants
     sc[128] = (be32(bools) & 0xFFFF) | (be32(bools + 16) & 0xFFFF) << 16;
@@ -4389,7 +4410,8 @@ struct Backend::Impl {
       uint32_t info = regs::Read(r, kInfo[i]);
       int32_t bias = int32_t(info << 6) >> 26;  // bits 20-25, signed
       auto format = regs::ColorFormat((info >> 16) & 0xF);
-      float scale = std::ldexp(1.0f, bias);
+      // 2^bias for bias in -32..31, built from its bits (std::ldexp was a libm call per target per draw)
+      float scale = std::bit_cast<float>(uint32_t(bias + 127) << 23);
       if (format == regs::ColorFormat::k16_16 || format == regs::ColorFormat::k16_16_16_16) scale /= 32.0f;
       float v[4] = {scale, scale, scale, scale};
       std::memcpy(&sc[140 + 4 * i], v, sizeof(v));
@@ -4687,6 +4709,7 @@ struct Backend::Impl {
     }
     if (ds.pipeline != pipeline) {
       list->setPipeline(pipeline);
+      stat_pipeline_binds++;
       ds.pipeline = pipeline;
       ds.bias_set = false;  // pipelines without dynamic depth bias overwrite it
     }
@@ -4707,12 +4730,12 @@ struct Backend::Impl {
       }
     }
     UploadAllocation shared;
-    if (last_shared.valid && std::memcmp(last_shared.cpu, shared_cpu, kSharedConstantsSize) == 0) {
+    if (last_shared.valid && std::memcmp(last_shared.cpu[last_shared.cur], shared_cpu, kSharedConstantsSize) == 0) {
       shared = last_shared.gpu;
     } else {
       shared = upload.Allocate(kSharedConstantsSize);
       std::memcpy(shared.cpu, shared_cpu, kSharedConstantsSize);
-      std::memcpy(last_shared.cpu, shared_cpu, kSharedConstantsSize);
+      last_shared.cur ^= 1;  // the block just built becomes the one to compare against
       last_shared.gpu = shared;
       last_shared.valid = true;
     }
@@ -5955,9 +5978,38 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
     if (seq_draws) seq += fmt::format("  {} draws\n", seq_draws);
     seq_draws = 0;
   };
-  for (const auto& c : f.commands) {
+  // The packet is 10-17 MB in heavy scenes and read once, so a draw's fetch block (768 B), register
+  // shadow (~900 B) and constant runs are cold in cache when DrawImpl reads them (sampling profile
+  // 11-15: the 768-byte fetch hash alone took ~230 ns per draw, 9x its compute cost, and the
+  // constant swap was memory-bound). The next draw's data is prefetched while this one records.
+  auto prefetch_lines = [](const uint8_t* p, uint32_t bytes) {
+    for (uint32_t o = 0; o < bytes; o += 64) __builtin_prefetch(p + o);
+  };
+  auto prefetch_draw = [&](const DrawCommand& n) {
+    prefetch_lines(f.At(n.fetch), 768);
+    prefetch_lines(f.At(n.regs), kRegShadowSize);
+    auto consts = [&](uint32_t at, const ConstantUse* use) {
+      const uint8_t* p = f.At(at);
+      uint32_t budget = 1024;  // the first KB of what the shader reads
+      if (!use) return prefetch_lines(p, budget);
+      for (const auto& r : use->runs) {
+        uint32_t bytes = std::min<uint32_t>(uint32_t(r.count) * 16u, budget);
+        prefetch_lines(p + uint32_t(r.first) * 16u, bytes);
+        budget -= bytes;
+        if (!budget) break;
+      }
+    };
+    consts(n.vs_consts, n.vs_use);
+    consts(n.ps_consts, n.ps_use);
+  };
+  size_t next_draw = 0;  // index in f.commands of the first kDraw after the current command
+  for (size_t ci = 0; ci < f.commands.size(); ci++) {
+    const auto& c = f.commands[ci];
     switch (c.kind) {
       case CommandKind::kDraw:
+        if (next_draw <= ci) next_draw = ci + 1;
+        while (next_draw < f.commands.size() && f.commands[next_draw].kind != CommandKind::kDraw) next_draw++;
+        if (next_draw < f.commands.size()) prefetch_draw(f.draws[f.commands[next_draw].index]);
         s.Draw(list, f, f.draws[c.index]);
         s.pass_draws++;
         DrawsRecorded(c.index + 1);
@@ -6031,8 +6083,10 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
                   "({:.2f} ms), {:.0f} full hashes of {:.1f} MB ({:.2f} ms)",
                   t.lookups / n, t.cached_blocks / n, t.sampled / n, t.sampled_ms / n, t.full / n,
                   t.full_bytes / n / 1048576.0, t.full_ms / n);
-      REXLOG_INFO("[native]   texture ms per frame: slots {:.2f}, {:.0f} slots from the memo, {:.0f} blocks from the memo",
-                  t.descriptor_ms / n, s.slot_memo_hits / n, s.block_memo_hits / n);
+      REXLOG_INFO("[native]   texture ms per frame: slots {:.2f}, {:.0f} slots from the memo, {:.0f} blocks from the memo; "
+                  "{:.0f} pipeline binds",
+                  t.descriptor_ms / n, s.slot_memo_hits / n, s.block_memo_hits / n, s.stat_pipeline_binds / n);
+      s.stat_pipeline_binds = 0;
       if (s.prehash_on) {
         REXLOG_INFO("[native]   hashed ahead per frame: {:.0f} used, {:.0f} not ready yet, {:.0f} not listed "
                     "(hashed on the render thread), {:.2f} ms to start",

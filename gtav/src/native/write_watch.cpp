@@ -359,13 +359,16 @@ void HarvestOne(uint32_t i, uint64_t epoch) {
 }
 
 // The views are scanned in parallel (~1.2 ms a frame on the render thread alone): one helper
-// thread per view after the first, which the render thread scans itself.
+// thread per view. The render thread kicks them at the start of a frame and goes on recording;
+// the first Clean()/Pending() of the frame waits for them (Settle), so the scans overlap the frame
+// setup and the first draws' other work (11-15 profile: the scan of one view on the render thread
+// plus the wait were 6% of it).
 struct HarvestHelpers {
   std::atomic<uint32_t> generation{0}, done{0};
   std::atomic<uint64_t> epoch{0};
   std::vector<std::thread> threads;
   void Start() {
-    for (uint32_t i = 1; i < g_view_count; i++)
+    for (uint32_t i = 0; i < g_view_count; i++)
       threads.emplace_back([this, i] {
         NameThread("gtav-harvest");
         uint32_t seen = 0;
@@ -379,17 +382,31 @@ struct HarvestHelpers {
       });
     for (auto& t : threads) t.detach();
   }
-  void Run(uint64_t e) {
+  void Run(uint64_t e) {  // kicks the helpers; Wait() blocks until every view is scanned
     done.store(0, std::memory_order_release);
     epoch.store(e, std::memory_order_release);
     generation.fetch_add(1, std::memory_order_acq_rel);
     generation.notify_all();
-    HarvestOne(0, e);
+  }
+  void Wait() {
     for (uint32_t d; (d = done.load(std::memory_order_acquire)) < threads.size();) done.wait(d);
   }
 };
 HarvestHelpers g_helpers;
 std::once_flag g_helpers_started;
+std::atomic<bool> g_harvest_pending{false};
+// Waits for the harvest Harvest() kicked, the first time a page epoch is consulted after it.
+void Settle() {
+  if (!g_harvest_pending.load(std::memory_order_acquire)) return;
+  auto start = std::chrono::steady_clock::now();
+  g_helpers.Wait();
+  g_harvest_pending.store(false, std::memory_order_release);
+  g_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+}  // namespace
+#else
+namespace {
+inline void Settle() {}
 }  // namespace
 #endif
 
@@ -399,7 +416,9 @@ void Harvest() {
   auto start = std::chrono::steady_clock::now();
   uint64_t epoch = g_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
   std::call_once(g_helpers_started, [] { g_helpers.Start(); });
+  Settle();  // (a previous frame's harvest nobody waited for)
   g_helpers.Run(epoch);
+  g_harvest_pending.store(true, std::memory_order_release);
   g_harvests++;
   g_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 #elif GTAV_WW_PAGEPROT
@@ -412,6 +431,7 @@ uint64_t Watch(uint32_t physical, uint32_t size) {
   physical &= kPhysicalSize - 1;
   if (uint64_t(physical) + size > kPhysicalSize) return 0;
 #if GTAV_WW_UFFD
+  Settle();  // the scans read g_interest and store page epochs: no new interest while they run
   // Pages no copy was made from yet are not protected: protect them in every view (before the
   // caller reads them). UFFDIO_WRITEPROTECT also covers pages without page tables yet.
   uint32_t first = physical >> kPageShift, last = (physical + size - 1) >> kPageShift;
@@ -467,6 +487,7 @@ uint64_t Watch(uint32_t physical, uint32_t size) {
 bool Pending(uint32_t physical, uint32_t size) {
 #if GTAV_WW_UFFD
   if (!g_ready || !size) return false;
+  Settle();
   physical &= kPhysicalSize - 1;
   auto* mem = REX_KERNEL_MEMORY();
   g_found = 0;
@@ -495,6 +516,7 @@ bool Pending(uint32_t physical, uint32_t size) {
 
 bool Clean(uint32_t physical, uint32_t size, uint64_t epoch) {
   if (!g_ready || !epoch || !size) return false;
+  Settle();
   physical &= kPhysicalSize - 1;
   if (uint64_t(physical) + size > kPhysicalSize) return false;
   uint32_t first = physical >> kPageShift, last = (physical + size - 1) >> kPageShift;
@@ -505,6 +527,7 @@ bool Clean(uint32_t physical, uint32_t size, uint64_t epoch) {
 
 void Touch(uint32_t physical, uint32_t size) {
   if (!g_ready || !size) return;
+  Settle();  // a running scan could overwrite the newer epoch stored here with its own
   Mark(physical & (kPhysicalSize - 1), size, g_epoch.fetch_add(1, std::memory_order_acq_rel) + 1);
 }
 
