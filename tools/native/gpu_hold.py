@@ -13,7 +13,12 @@ assert cuda.cuDeviceGet(ctypes.byref(dev), 0) == 0, 'cuDeviceGet'
 ctx = ctypes.c_void_p()
 assert cuda.cuCtxCreate_v2(ctypes.byref(ctx), 0, dev) == 0, 'cuCtxCreate'
 ptr = ctypes.c_uint64()
-r = cuda.cuMemAlloc_v2(ctypes.byref(ptr), ctypes.c_size_t(mib << 20))
+# With another job holding most of the card (h2work/guard.sh's Humanizer jobs, 5 GB) the full size
+# does not fit: step down. ~900 MiB + the context still crosses that guard's 1000 MiB "GPU wanted"
+# line, so it stops its jobs and frees the card for the game.
+for size in [mib] + [m for m in (960, 900, 850, 800) if m < mib]:
+    r = cuda.cuMemAlloc_v2(ctypes.byref(ptr), ctypes.c_size_t(size << 20))
+    if r == 0: break
 assert r == 0, f'cuMemAlloc {r}'
 print('held', flush=True)
 signal.pause()
