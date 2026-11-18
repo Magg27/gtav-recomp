@@ -9,6 +9,7 @@ MAXLOAD=${1:-5}; MAXSECS=${2:-21600}; DISK=${3:-sdb}
 # logs/gate_maxload overrides MAXLOAD while a chain is already running (owner 11-16: run the A/B
 # sides under the same load instead of waiting for a quiet CPU; ABBA order cancels the shared load).
 F="$(dirname "$0")/../../logs/gate_maxload"; [ -f "$F" ] && MAXLOAD=$(cat "$F")
+MAXDISK=15; F="$(dirname "$0")/../../logs/gate_maxdisk"; [ -f "$F" ] && MAXDISK=$(cat "$F")  # (an indexer on the game disk)
 S0=$(date +%s); ok=0
 while :; do
   l=$(cut -d' ' -f1 /proc/loadavg | cut -d. -f1)
@@ -24,7 +25,7 @@ while :; do
   pgrep -x blender >/dev/null && apps=$((apps + 1))
   a=$(awk -v d="$DISK" '$3==d{print $13}' /proc/diskstats); sleep 10; b=$(awk -v d="$DISK" '$3==d{print $13}' /proc/diskstats)
   disk=$(( (${b:-0} - ${a:-0}) / 100 ))  # percent of the 10 s the disk had a request in flight
-  if [ "$l" -lt "$MAXLOAD" ] && [ "${gpu:-0}" -lt 20 ] && [ "$apps" = 0 ] && [ "$disk" -lt 15 ]; then ok=$((ok+1)); else ok=0; fi
+  if [ "$l" -lt "$MAXLOAD" ] && [ "${gpu:-0}" -lt 20 ] && [ "$apps" = 0 ] && [ "$disk" -lt "$MAXDISK" ]; then ok=$((ok+1)); else ok=0; fi
   [ $ok -ge 2 ] && { echo "quiet at $(date +%H:%M): load $l, gpu ${gpu}%, $DISK ${disk}% busy"; exit 0; }
   if [ $(( $(date +%s) - S0 )) -gt "$MAXSECS" ]; then echo "gave up after $MAXSECS s (load $l, gpu ${gpu}%, gpu apps $apps, $DISK ${disk}% busy)"; exit 2; fi
   sleep 50

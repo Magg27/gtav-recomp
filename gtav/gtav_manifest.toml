@@ -11,6 +11,13 @@ patch_file_path = "assets/default.xexp"
 patched_file_path = "assets/default_patched.xex"
 out_directory_path = "generated/default"
 includes = []
+# Dev experiment (11-18): CR fields, CTR, XER and the reservation as C++ locals, so the compiler
+# keeps them in host registers instead of the context struct.
+ctr_as_local = true
+xer_as_local = true
+cr_as_local = true
+# reserved_as_local: NO. GTA splits ldarx and stdcx. across functions (spin-lock helper sub_83829CD8),
+# so a per-function reservation never matches: a thread spins forever (hang 11-18).
 
 # Entry points the analyzer misses, for the TU27 build (0x00001B09). Base-build (v9) list: gtav_manifest.base_v9.toml.
 [entrypoint.functions]
