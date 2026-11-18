@@ -3,13 +3,16 @@
 // The recompiled code brackets every non-leaf guest function with the Xbox 360 CRT helpers
 // __savegprlr_N / __restgprlr_N (store rN..r31 + the link register to the guest stack, load them
 // back). Generated, they are extern functions: two host calls with their own prologues around
-// every guest call (~2 million a second on the main thread). This header is included at the end of
-// generated/default/gtav_pch.h: the helpers become always-inline functions and DEFINE_REX_FUNC gives
+// every guest call (~2 million a second on the main thread). This header is force-included into the
+// generated sources (it includes generated/default/gtav_pch.h first): the helpers become always-inline functions and DEFINE_REX_FUNC gives
 // their generated bodies only the __imp__ name (the trick fs/gtav_pch.h uses for hooked functions),
 // so every call site inlines the stores/loads. Guest semantics are unchanged: same addresses, same
 // byte-swapped volatile accesses, same lr handling. Re-apply the include after codegen regenerates
 // the header. Linux/Windows x86-64 only (Mach-O has no overridable alias).
 #pragma once
+// Force-included before each generated source (GTAV_GPRLR_INLINE, gtav/CMakeLists.txt), so the
+// generated pch comes first; codegen regenerating gtav_pch.h no longer drops it (it did on 11-16).
+#include <gtav_pch.h>  // the generated one (generated/default on the include path), not fs/gtav_pch.h
 #if !defined(__APPLE__)
 #define GTAV_GPRLR_INL___savegprlr_14 ,1
 #define GTAV_GPRLR_INL___savegprlr_15 ,1

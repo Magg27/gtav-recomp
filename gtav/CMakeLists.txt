@@ -226,6 +226,18 @@ elseif(WIN32 AND NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     endif()
 endif()
 
+# Dev builds: inline the __savegprlr/__restgprlr helpers into every generated function
+# (fs/gprlr_inline.h, +2.6% on the main thread 11-14). Off by default: it changes the release's
+# game code, which waits for the owner (after v0.4.0).
+option(GTAV_GPRLR_INLINE "Inline the guest register save/restore helpers (dev builds)" OFF)
+if(GTAV_GPRLR_INLINE AND TARGET gtav_recomp AND NOT APPLE)
+    if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        target_compile_options(gtav_recomp PRIVATE "/FI${CMAKE_CURRENT_SOURCE_DIR}/fs/gprlr_inline.h")
+    else()
+        target_compile_options(gtav_recomp PRIVATE "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/fs/gprlr_inline.h")
+    endif()
+endif()
+
 # The SDK exports REXGLUE_ENABLE_PROFILING / _PERF_COUNTERS to every non-Release build: each
 # indirect guest call then does an atomic add on one shared counter in rexruntime (~3% of every
 # game thread in a Windows profile, plus cache-line traffic between them). Off for play.
