@@ -63,9 +63,11 @@ LINE0=$(wc -l <"$L")
 # summary ("gpu contention: N of M samples"); bin_ab_linux.sh redoes such runs.
 GPUF="$ROOT/logs/${NAME}_gpu.txt"; : >"$GPUF"
 ( while kill -0 $PID 2>/dev/null; do
-    # gpu_hold.py (ours, started here or by bin_ab_linux.sh) is not contention.
+    # gpu_hold.py (ours, started here or by bin_ab_linux.sh) is not contention, nor a process
+    # stopped by h2pause.sh (state T: it holds memory but uses no GPU time).
     o=$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null | grep -v '/gtav' |
-        while IFS=', ' read -r p n; do grep -qa gpu_hold.py /proc/$p/cmdline 2>/dev/null || echo "$n"; done |
+        while IFS=', ' read -r p n; do grep -qa gpu_hold.py /proc/$p/cmdline 2>/dev/null ||
+          [ "$(awk '{print $3}' /proc/$p/stat 2>/dev/null)" = T ] || echo "$n"; done |
         xargs -rn1 basename 2>/dev/null | sort -u | tr '\n' ',')
     echo "$(date +%H:%M:%S) ${o:-none}" >>"$GPUF"; sleep 5; done ) & GPUW=$!
 if [ "${BENCH_PERF:-0}" = 1 ]; then

@@ -18,7 +18,9 @@ while :; do
           nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1; } | sort -n | head -1)
   # GATE_IGNORE_PID: the caller's own gpu_hold.py. A Blender that is still loading its scene on the
   # CPU is not on the GPU yet but will be within a minute: not quiet either.
-  apps=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -vx "${GATE_IGNORE_PID:-none}" | grep -c .)
+  # (processes stopped by h2pause.sh, state T, hold memory but no GPU time: not counted)
+  apps=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -vx "${GATE_IGNORE_PID:-none}" |
+         while read -r p; do [ "$(awk '{print $3}' /proc/$p/stat 2>/dev/null)" = T ] || echo "$p"; done | grep -c .)
   pgrep -x blender >/dev/null && apps=$((apps + 1))
   a=$(awk -v d="$DISK" '$3==d{print $13}' /proc/diskstats); sleep 10; b=$(awk -v d="$DISK" '$3==d{print $13}' /proc/diskstats)
   disk=$(( (${b:-0} - ${a:-0}) / 100 ))  # percent of the 10 s the disk had a request in flight

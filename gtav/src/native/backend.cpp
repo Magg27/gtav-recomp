@@ -3804,6 +3804,7 @@ struct Backend::Impl {
     const BlockMemo* bm = nullptr;  // the block memo entry holding this block's slots (sc 0-191)
     uint64_t hash = 0;              // its hash when stored: a reused entry no longer matches
     uint32_t offset = 0;
+    uint32_t mask = 0;              // the slots the entry was built for
     bool valid = false;
   } fetch_cache;
   // Fetch blocks keyed by content: a material drawn again (hundreds of times a frame) gets its
@@ -3813,18 +3814,27 @@ struct Backend::Impl {
     uint64_t hash = 0;
     uint32_t generation = 0;
     std::array<uint32_t, 192> sc{};
-    std::array<uint8_t, 768> block{};
+    uint32_t key_size = 0;
+    std::array<uint8_t, 4 + 768> key{};  // the slot mask, then the six words of each sampled slot
   };
   static constexpr uint32_t kBlockMemoSize = 1024;
   std::vector<BlockMemo> block_memo = std::vector<BlockMemo>(kBlockMemoSize);
   uint64_t block_memo_hits = 0;
   // Per-slot memo of TextureDescriptor + SamplerDescriptor, keyed by the six fetch words:
-  // ~20,000 slot lookups a frame repeat a few hundred fetch constants. Results only change at a
-  // resolve or a new frame, which bump the generation.
+  // ~20,000 slot lookups a frame repeat a few hundred fetch constants. Valid for the frame
+  // (frame_generation), and until a resolve writes the slot's base address: every resolve used to
+  // drop the whole memo, ~780 full lookups a frame. A resolve only changes what its own address
+  // maps to (resolved_latest/by_address/depth are keyed by it), so it stamps that address's
+  // bucket in resolve_seen; an entry filled before the stamp is stale.
   struct SlotMemo {
     uint32_t words[6];
     uint32_t dim, descriptor, sampler, generation;
+    uint32_t filled = 0;  // resolve_count when filled
   };
+  static uint32_t ResolveBucket(uint32_t base) { return ((base & 0x1FFFFFFF) * 0x9E3779B1u) >> 22; }  // 1024
+  std::array<uint32_t, 1024> resolve_seen{};
+  uint32_t resolve_count = 0;
+  uint32_t frame_generation = 1;
   static constexpr uint32_t kSlotMemoSize = 4096;
   std::vector<SlotMemo> slot_memo = std::vector<SlotMemo>(kSlotMemoSize);
   uint32_t slot_generation = 1;
@@ -4236,16 +4246,30 @@ struct Backend::Impl {
     texture_log.clear();
     // The texture/sampler descriptors of a fetch block only change at a resolve (new resolve
     // textures, layouts): a draw sharing the previous draw's block reuses its slots.
-    bool fetch_cached = !dumping && fetch_cache.valid && fetch_cache.offset == d.fetch &&
+    // Only the slots the two shaders sample (Shader::texture_bindings): the rest of the block holds
+    // vertex fetch constants (a different buffer address every draw), so whole-block keys rarely
+    // matched, and descriptors for unsampled slots were never read.
+    const uint32_t tex_mask =
+        dumping ? ~0u : (d.vs_use ? d.vs_use->texture_mask : ~0u) | (d.ps_use ? d.ps_use->texture_mask : ~0u);
+    bool fetch_cached = !dumping && fetch_cache.valid && fetch_cache.offset == d.fetch && fetch_cache.mask == tex_mask &&
                         fetch_cache.bm->hash == fetch_cache.hash && fetch_cache.bm->generation == slot_generation;
     if (fetch_cached) std::memcpy(sc, fetch_cache.bm->sc.data(), sizeof(fetch_cache.bm->sc));
     tprof.cached_blocks += fetch_cached;
     BlockMemo* bm = nullptr;      // the entry to fill (a block memo miss)
     BlockMemo* bm_hit = nullptr;  // the entry this draw's slots came from or went to
+    uint8_t key[4 + 768];
+    uint32_t key_size = 0;
     if (!fetch_cached && !dumping) {
-      uint64_t h = Hash(fetch, 768);
+      std::memcpy(key, &tex_mask, 4);
+      key_size = 4;
+      for (uint32_t m = tex_mask; m; m &= m - 1) {
+        std::memcpy(key + key_size, fetch + std::countr_zero(m) * 24, 24);
+        key_size += 24;
+      }
+      uint64_t h = Hash(key, key_size);
       bm = &block_memo[h & (kBlockMemoSize - 1)];
-      if (bm->generation == slot_generation && bm->hash == h && std::memcmp(bm->block.data(), fetch, 768) == 0) {
+      if (bm->generation == slot_generation && bm->hash == h && bm->key_size == key_size &&
+          std::memcmp(bm->key.data(), key, key_size) == 0) {
         std::memcpy(sc, bm->sc.data(), sizeof(bm->sc));
         block_memo_hits++;
         fetch_cached = true;
@@ -4257,12 +4281,16 @@ struct Backend::Impl {
     }
     auto slots_start = prof.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (uint32_t slot = 0; slot < 32 && !fetch_cached; slot++) {
-      uint32_t words[6];
-      for (int w = 0; w < 6; w++) words[w] = be32(fetch + slot * 24 + w * 4);
       sc[0 * 32 + slot] = kNull2D;
       sc[1 * 32 + slot] = kNull3D;
       sc[2 * 32 + slot] = kNullCube;
       sc[96 + slot] = blit_sampler;
+      if (!((tex_mask >> slot) & 1)) {
+        sc[160 + slot] = 0x3F800000u;  // 1.0f
+        continue;
+      }
+      uint32_t words[6];
+      for (int w = 0; w < 6; w++) words[w] = be32(fetch + slot * 24 + w * 4);
       float exp_scale = 1.0f;  // s<slot>_ExpScale at 640: the fetch constant's 2^exp_adjust
       // 2^exp_adjust (-32..31) built from its bits: std::ldexp is a libm call per slot.
       if ((words[0] & 3) == 2) exp_scale = std::bit_cast<float>(uint32_t((int32_t(words[3] << 13) >> 26) + 127) << 23);
@@ -4273,7 +4301,8 @@ struct Backend::Impl {
       uint32_t mix = words[0] * 0x9E3779B1u;
       for (int w = 1; w < 6; w++) mix = (mix ^ words[w]) * 0x9E3779B1u;
       SlotMemo& memo = slot_memo[(mix >> 20) & (kSlotMemoSize - 1)];
-      if (!dumping && memo.generation == slot_generation && std::memcmp(memo.words, words, 24) == 0) {
+      if (!dumping && memo.generation == frame_generation && std::memcmp(memo.words, words, 24) == 0 &&
+          resolve_seen[ResolveBucket(FetchBaseAddress(words))] <= memo.filled) {
         slot_memo_hits++;
         sc[memo.dim * 32 + slot] = memo.descriptor;
         sc[96 + slot] = memo.sampler;
@@ -4344,7 +4373,8 @@ struct Backend::Impl {
         memo.dim = dim;
         memo.descriptor = descriptor;
         memo.sampler = sc[96 + slot];
-        memo.generation = slot_generation;
+        memo.generation = frame_generation;
+        memo.filled = resolve_count;
       }
     }
     if (!fetch_cached && prof.on)
@@ -4352,12 +4382,13 @@ struct Backend::Impl {
           8 * std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - slots_start).count();
     if (bm) {  // a block memo miss: remember this block's words
       std::memcpy(bm->sc.data(), sc, sizeof(bm->sc));
-      std::memcpy(bm->block.data(), fetch, 768);
+      std::memcpy(bm->key.data(), key, key_size);
+      bm->key_size = key_size;
       bm->generation = slot_generation;
       bm_hit = bm;
     }
     // The next draw with the same fetch offset takes its slots from that entry (no copy of its own).
-    if (bm_hit) fetch_cache = {bm_hit, bm_hit->hash, d.fetch, true};
+    if (bm_hit) fetch_cache = {bm_hit, bm_hit->hash, d.fetch, tex_mask, true};
     prof.Mark(prof.fetch);
     const uint8_t* bools = r;  // the shadow starts with the 0x4900 bool constants
     sc[128] = (be32(bools) & 0xFFFF) | (be32(bools + 16) & 0xFFFF) << 16;
@@ -5624,13 +5655,14 @@ struct Backend::Impl {
   void Resolve(RenderCommandList* list, const FramePacket& f, const ResolveCommand& rc) {
     ScopedMs timer{t_resolve};
     fetch_cache.valid = false;
-    slot_generation++;
+    slot_generation++;  // (the block memo; the slot memo is invalidated by address below)
     InvalidateDrawState();
     const uint8_t* r = f.At(rc.regs);
     // Destination: the texture object's fetch constant (header 24 bytes + MipFlush).
     const uint32_t* words = rc.dest_words + 7;
     uint32_t base = FetchBaseAddress(words) & 0x1FFFFFFF;
     if (!base) return;
+    resolve_seen[ResolveBucket(base)] = ++resolve_count;
     uint32_t dw = (words[2] & 0x1FFF) + 1, dh = ((words[2] >> 13) & 0x1FFF) + 1;
     uint32_t source = rc.flags & 7;
     auto surface = regs::Surface(r);
@@ -5939,6 +5971,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.last_shared.valid = false;
   s.fetch_cache.valid = false;
   s.slot_generation++;
+  s.frame_generation++;
   s.EvictTextures();
   s.EvictRectCache();
   s.InvalidateDrawState();

@@ -3102,10 +3102,10 @@ index 19874a5..1c2dada 100644
    }
  
 diff --git a/src/graphics/pipeline/shader/shader.cpp b/src/graphics/pipeline/shader/shader.cpp
-index a53a222..087fada 100644
+index a53a222..b41a857 100644
 --- a/src/graphics/pipeline/shader/shader.cpp
 +++ b/src/graphics/pipeline/shader/shader.cpp
-@@ -159,3 +159,43 @@ Shader::Translation* Shader::CreateTranslationInstance(uint64_t modification) {
+@@ -159,3 +159,57 @@ Shader::Translation* Shader::CreateTranslationInstance(uint64_t modification) {
  }
  
  }  // namespace rex::graphics
@@ -3148,6 +3148,20 @@ index a53a222..087fada 100644
 +  if (map.float_dynamic_addressing) return false;
 +  for (int i = 0; i < 4; ++i) out[i] = map.float_bitmap[i];
 +  return true;
++}
++
++// Bitmap of the texture fetch constants (0-31) the shader's tfetch instructions read: the
++// native renderer builds descriptors only for these slots. All bits set if the ucode is missing.
++extern "C" REX_SHADER_EXPORT uint32_t rex_shader_texture_fetch_mask(bool pixel, const uint32_t* ucode_dwords,
++                                                                     uint32_t dword_count) {
++  using namespace rex::graphics;
++  if (!ucode_dwords || !dword_count) return UINT32_MAX;
++  Shader shader(pixel ? xenos::ShaderType::kPixel : xenos::ShaderType::kVertex, 0, ucode_dwords, dword_count);
++  rex::string::StringBuffer disasm;
++  shader.AnalyzeUcode(disasm);
++  uint32_t mask = 0;
++  for (const auto& binding : shader.texture_bindings()) mask |= 1u << (binding.fetch_constant & 31);
++  return mask;
 +}
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
 index 001f36b..0a6a909 100644

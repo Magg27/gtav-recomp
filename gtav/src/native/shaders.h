@@ -22,6 +22,7 @@ struct ConstantUse {
   };
   uint32_t count = 256;
   std::vector<Run> runs{{0, 256}};
+  uint32_t texture_mask = ~0u;  // texture fetch constants (slots 0-31) the shader samples; all = unknown
 };
 const ConstantUse& ShaderConstants(uint32_t guest_object);
 

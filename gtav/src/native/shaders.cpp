@@ -34,6 +34,8 @@ REXCVAR_DEFINE_STRING(gtav_native_shader_dump, "", "GTAV",
 // SDK (librexgpu): float constant registers a shader's ucode can read (256 if indexed).
 extern "C" bool rex_shader_float_constant_bitmap(bool pixel, const uint32_t* ucode_dwords, uint32_t dword_count,
                                                  uint64_t out[4]);
+// SDK (librexgpu): the texture fetch constants (0-31) the ucode samples.
+extern "C" uint32_t rex_shader_texture_fetch_mask(bool pixel, const uint32_t* ucode_dwords, uint32_t dword_count);
 
 namespace gtav::native {
 namespace {
@@ -66,6 +68,8 @@ const ConstantUse* MakeConstantUse(bool pixel, const uint8_t* ucode, uint32_t si
       use->count = r + 1;
     }
   }
+  if (size >= 4)
+    use->texture_mask = rex_shader_texture_fetch_mask(pixel, reinterpret_cast<const uint32_t*>(ucode), size / 4);
   slot = std::move(use);
   return slot.get();
 }
