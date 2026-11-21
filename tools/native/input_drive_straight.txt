@@ -1,0 +1,3 @@
+# start_s dur_s buttons lt rt lx ly rx ry (see --input_script); the file loops.
+# Vehicle acceleration vs frame rate (#12): full throttle, no steering. Pair with "drivetest".
+0.00 10.00 0000 0 255 0 0 0 0

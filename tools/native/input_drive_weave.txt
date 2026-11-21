@@ -1,0 +1,6 @@
+# start_s dur_s buttons lt rt lx ly rx ry (see --input_script); the file loops (period 2 s).
+# Vehicle handling vs frame rate (#12): full throttle, steering full right for 1 s, full left for
+# 1 s. Pair with the "drivetest" debug command (puts the player in the nearest car and logs
+# "[drive]" lines) and compare the heading swing at 30 fps against uncapped.
+0.00 1.00 0000 0 255 32000 0 0 0
+1.00 1.00 0000 0 255 -32000 0 0 0

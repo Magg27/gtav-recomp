@@ -25,7 +25,7 @@ if [ "${BENCH_GPU_HOLD:-1}" != 0 ]; then
 fi
 unhold() { [ -n "$HOLD" ] && kill "$HOLD" 2>/dev/null; }
 "$ROOT/play.sh" "$NAME" --gtav_native_fps --gtav_native_stats=true --gtav_native_hidden=true --audio_mute=true \
-  --gtav_vehicle_30fps=false --input_script="$GO" "$@" >"$ROOT/logs/$NAME.stdout" 2>&1 &
+  --gtav_vehicle_30fps=${BENCH_VEH30:-false} --input_script="$GO" "$@" >"$ROOT/logs/$NAME.stdout" 2>&1 &
 PID=$!
 S=$(date +%s)
 # Boot time counts only while the game disk (BENCH_DISK, default sdb) is not saturated by another

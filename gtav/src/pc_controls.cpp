@@ -67,6 +67,14 @@ REX_EXTERN(sub_82C9C078);         // SET_ENTITY_HEALTH(entity, health)
 REX_EXTERN(sub_82C9ADD8);         // GET_ENTITY_COORDS(entity, alive) -> vector3
 REX_EXTERN(sub_82D5F218);         // GET_CLOSEST_VEHICLE(x, y, z, radius, model, flags)
 REX_EXTERN(sub_82D0C3D8);         // SET_PED_INTO_VEHICLE(ped, vehicle, seat)
+REX_EXTERN(sub_82C9AF18);         // GET_ENTITY_HEADING(entity) -> float
+REX_EXTERN(sub_82C87678);         // GET_GAME_TIMER() -> ms
+REX_EXTERN(sub_82C87690);         // GET_FRAME_TIME() -> float s
+REX_EXTERN(sub_83525A90);         // TIMESTEP() -> float s
+REX_EXTERN(sub_82C9C000);         // SET_ENTITY_COORDS_NO_OFFSET(entity, x, y, z, 0, 0, 0)
+REX_EXTERN(sub_82CA4DB8);         // CLEAR_AREA(x, y, z, radius, 1, 0, 0, 0)
+REX_EXTERN(sub_82D5CBC8);         // CREATE_VEHICLE(model, x, y, z, heading, 1, 1)
+REX_EXTERN(sub_82D4E168);         // SET_VEHICLE_ON_GROUND_PROPERLY(vehicle)
 REX_EXTERN(sub_82D28BB8);         // REQUEST_SCRIPT(name)
 REX_EXTERN(sub_82D28BD8);         // HAS_SCRIPT_LOADED(name)
 REX_EXTERN(sub_82D28BC8);         // SET_SCRIPT_AS_NO_LONGER_NEEDED(name)
@@ -86,6 +94,11 @@ REXCVAR_DEFINE_BOOL(gtav_debug_commands, false, "GTAV",
                     "('kill' = SET_ENTITY_HEALTH(player, 0)) and deleted");
 
 namespace {
+bool g_drivelog = false;  // "drivelog" debug command
+// "drivetest": 1 = teleported to the airport tarmac, waiting for the map + model; 2 = in the car.
+int g_drivetest = 0;
+std::chrono::steady_clock::time_point g_drivetest_at{};
+constexpr float kDriveX = -1336.0f, kDriveY = -3044.0f, kDriveZ = 13.9f, kDriveHeading = 150.0f;
 
 using rex::input::mnk::InputContext;
 
@@ -456,6 +469,19 @@ REX_HOOK_RAW(sub_82CE9CA8) {
             REXLOG_INFO("[controls] debug pos: {:.1f} {:.1f} {:.1f}", std::bit_cast<float>(xyz[0]),
                         std::bit_cast<float>(xyz[1]), std::bit_cast<float>(xyz[2]));
           }
+          // "drivelog": log the player vehicle's position and heading ~30 times a second, with the
+          // game timer and frame time ("[drive]" lines): frame-rate dependence of the handling (#12).
+          if (cmd == "drivelog") g_drivelog = !(arg == "off");
+          // "drivetest": the same car (a Blista), place and heading every run: teleport to the
+          // airport tarmac, then (below) spawn it once the map and model are in, and log.
+          if (cmd == "drivetest") {
+            const auto F = [](float f) { return std::bit_cast<uint32_t>(f); };
+            Call(ctx, base, sub_82C9C000, {ped, F(kDriveX), F(kDriveY + 20.0f), F(kDriveZ), 0, 0, 0});
+            Call(ctx, base, sub_82CF0CC0, {Joaat("BLISTA")});
+            g_drivetest = 1;
+            g_drivetest_at = now + std::chrono::seconds(8);
+            REXLOG_INFO("[controls] drivetest: teleported, loading");
+          }
           if (cmd == "car") {  // the nearest vehicle, driver's seat
             uint32_t xyz[3];
             CallVector(ctx, base, sub_82C9ADD8, {ped, 1}, xyz);
@@ -469,6 +495,38 @@ REX_HOOK_RAW(sub_82CE9CA8) {
             if (vehicle) Call(ctx, base, sub_82D0C3D8, {ped, vehicle, uint32_t(-1)});
           }
         }
+      }
+    }
+    if (g_drivetest == 1 && now >= g_drivetest_at) {
+      const auto F = [](float f) { return std::bit_cast<uint32_t>(f); };
+      if (Call(ctx, base, sub_82CF0A90, {Joaat("BLISTA")}) & 0xFF) {
+        Call(ctx, base, sub_82CA4DB8, {F(kDriveX), F(kDriveY), F(kDriveZ), F(80.0f), 1, 0, 0, 0});
+        const uint32_t vehicle = Call(ctx, base, sub_82D5CBC8,
+                                      {Joaat("BLISTA"), F(kDriveX), F(kDriveY), F(kDriveZ), F(kDriveHeading), 1, 1});
+        if (vehicle) {
+          Call(ctx, base, sub_82D4E168, {vehicle});
+          Call(ctx, base, sub_82D0C3D8, {ped, vehicle, uint32_t(-1)});
+          g_drivelog = true;
+          g_drivetest = 2;
+        }
+        REXLOG_INFO("[controls] drivetest: vehicle {:08X} (guest memory base {})", vehicle, static_cast<const void*>(base));
+      } else {  // requested again every try, as the "model" command does
+        Call(ctx, base, sub_82CF0CC0, {Joaat("BLISTA")});
+        static int tries = 0;
+        if (++tries % 10 == 0) REXLOG_INFO("[controls] drivetest: model not loaded after {} tries", tries);
+        g_drivetest_at = now + std::chrono::milliseconds(200);
+      }
+    }
+    if (g_drivelog) {
+      if (const uint32_t vehicle = Call(ctx, base, sub_82D0C510, {ped, 0})) {
+        uint32_t xyz[3];
+        CallVector(ctx, base, sub_82C9ADD8, {vehicle, 1}, xyz);
+        const float heading = std::bit_cast<float>(Call(ctx, base, sub_82C9AF18, {vehicle}));
+        const uint32_t timer = Call(ctx, base, sub_82C87678, {});
+        const float dt = std::bit_cast<float>(Call(ctx, base, sub_82C87690, {}));
+        const float step = std::bit_cast<float>(Call(ctx, base, sub_83525A90, {}));
+        REXLOG_INFO("[drive] t {} dt {:.4f} step {:.4f} pos {:.2f} {:.2f} {:.2f} heading {:.2f}", timer, dt, step,
+                    std::bit_cast<float>(xyz[0]), std::bit_cast<float>(xyz[1]), std::bit_cast<float>(xyz[2]), heading);
       }
     }
     if (!g_pending_stream.empty()) {
