@@ -1393,10 +1393,13 @@ class Renderer {
     // swap chain image (MoltenVK: ~4 ms of GPU idle per frame on the M1).
     auto record_end = std::chrono::steady_clock::now();
     if (gpu_timed_[slot]) list_->writeTimestamp(gpu_times_[slot].get(), 1);
-    list_->end();
     {
-      const plume::RenderCommandList* main = list_;
+      // Ended on the submit thread: vkEndCommandBuffer finalizes the whole frame's commands (~5%
+      // of the render thread on the S23 FE's Adreno driver), and nothing records into this list
+      // again before its fence (the present list goes after it on the same thread).
+      plume::RenderCommandList* main = list_;
       submitter_.Push([this, main] {
+        main->end();
         const plume::RenderCommandList* lists = main;
         queue_cmd_->executeCommandLists(&lists, 1, nullptr, 0, nullptr, 0, nullptr);
       });
