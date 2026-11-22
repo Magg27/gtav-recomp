@@ -4131,6 +4131,21 @@ struct Backend::Impl {
                                                                         : 0;
         rect_elems.push_back({vl.host_offset[n], floats, f});
       }
+      // The five copied corners: a fixed-size copy the compiler inlines for the usual strides
+      // (a libc memmove call per vertex was ~12% of the record thread's memmove time on the S23 FE).
+      auto copy_vertex = [stride](uint8_t* d, const uint8_t* v) {
+        switch (stride) {
+#define GTAV_RECT_COPY(n) \
+  case n:                 \
+    std::memcpy(d, v, n); \
+    return;
+          GTAV_RECT_COPY(8) GTAV_RECT_COPY(12) GTAV_RECT_COPY(16) GTAV_RECT_COPY(20) GTAV_RECT_COPY(24)
+          GTAV_RECT_COPY(28) GTAV_RECT_COPY(32) GTAV_RECT_COPY(36) GTAV_RECT_COPY(40) GTAV_RECT_COPY(44)
+          GTAV_RECT_COPY(48) GTAV_RECT_COPY(52) GTAV_RECT_COPY(56) GTAV_RECT_COPY(60) GTAV_RECT_COPY(64)
+#undef GTAV_RECT_COPY
+          default: std::memcpy(d, v, stride);
+        }
+      };
       ConvertInto(dst, size, [&](uint8_t* out) {
         const uint8_t* src = rect_conv[s].data();
         for (uint32_t q = 0; q < rects; q++, out += 6 * stride) {
@@ -4146,7 +4161,7 @@ struct Backend::Impl {
           const uint8_t* va = src + size_t(v[(c + 1) % 3]) * stride;
           const uint8_t* vb = src + size_t(v[(c + 2) % 3]) * stride;
           const uint8_t* order[5] = {corner, va, vb, vb, va};
-          for (int k = 0; k < 5; k++) std::memcpy(out + k * stride, order[k], stride);
+          for (int k = 0; k < 5; k++) copy_vertex(out + k * stride, order[k]);
           uint8_t* fourth = out + 5 * stride;
           for (const auto& e : rect_elems) {
             if (e.floats) {  // 32-bit float components: no format dispatch
