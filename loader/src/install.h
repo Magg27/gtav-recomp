@@ -44,6 +44,13 @@ bool RunIphoneBuild(const std::filesystem::path& root, const std::filesystem::pa
 // The Android build, from any desktop system: libgtav_game.so (aarch64 Android, against the APK's
 // libgtav_fast.so), the shaders for Adreno and expected.txt in <home>/android/gtav-android-pack.zip.
 // The APK (no game code) imports the pack and installs the game files from the discs itself.
+// Android app: build libgtav_game.so on the phone. kit = the APK's unpacked build kit (manifest,
+// partition seed, expected.txt, fs/ headers, android/{interface,include,clang}); tools = the APK's
+// native library folder (librexglue_exe.so, libclang_exe.so, liblld_exe.so, libgtav_fast.so,
+// librexruntime.so); home = holds data/game; build = scratch folder (app-private storage).
+bool RunAndroidOnDevice(const std::filesystem::path& kit, const std::filesystem::path& tools,
+                        const std::filesystem::path& home, const std::filesystem::path& build,
+                        const std::filesystem::path& out_lib, InstallUi& ui, std::wstring* error);
 bool RunAndroidBuild(const std::filesystem::path& root, const std::filesystem::path& home, InstallUi& ui,
                      std::wstring* error);
 

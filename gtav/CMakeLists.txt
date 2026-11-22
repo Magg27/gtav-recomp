@@ -109,7 +109,9 @@ elseif(ANDROID)
         set_target_properties(gtav PROPERTIES OUTPUT_NAME main)
     endif()
     target_link_libraries(gtav PRIVATE android log)
-    target_sources(gtav PRIVATE src/android_threads.cpp)
+    # adreno_shader_fix.cpp: the on-phone shader translation (shader_compiler.cpp) applies the
+    # Adreno fixes itself now.
+    target_sources(gtav PRIVATE src/android_threads.cpp src/native/adreno_shader_fix.cpp)
     target_link_options(gtav PRIVATE -Wl,--wrap=pthread_create)
 else()
     add_executable(gtav ${GTAV_SOURCES})

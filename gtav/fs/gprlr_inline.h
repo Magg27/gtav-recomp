@@ -55,11 +55,17 @@
 #define GTAV_GPRLR_IS_INL(name) GTAV_GPRLR_IS_INL_(GTAV_GPRLR_INL_##name)
 #define GTAV_GPRLR_CAT(a, b) GTAV_GPRLR_CAT_(a, b)
 #define GTAV_GPRLR_CAT_(a, b) a##b
+#if defined(GTAVFS_DEFINE_1)
+// Release builds (fs/gtav_pch.h, the installer's compile): every other function keeps the
+// release definition (hooked: only __imp__<name>; the rest: <name> aliases __imp__<name>).
+#define GTAV_GPRLR_DEFINE_0(name) GTAVFS_CAT(GTAVFS_DEFINE_, GTAVFS_IS_HOOKED(name))(name)
+#else
 // The generated (Linux) DEFINE_REX_FUNC: <name> is a weak alias of __imp__<name>.
 #define GTAV_GPRLR_DEFINE_0(name)                              \
   __attribute__((alias("__imp__" #name)))                      \
   __attribute__((weak, noinline)) extern "C" REX_FUNC(name);   \
   REX_EXTERN(__imp__##name)
+#endif
 // The helpers: the generated body is only __imp__<name>; <name> is the inline version below.
 #define GTAV_GPRLR_DEFINE_1(name) REX_EXTERN(__imp__##name)
 #undef DEFINE_REX_FUNC

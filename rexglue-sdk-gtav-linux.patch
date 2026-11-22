@@ -4450,7 +4450,7 @@ index c24fbd1..0663781 100644
    return 1;
  }
 diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
-index 76cc877..f59613e 100644
+index 76cc877..34c19f6 100644
 --- a/src/system/xmemory.cpp
 +++ b/src/system/xmemory.cpp
 @@ -13,12 +13,18 @@
@@ -4461,7 +4461,7 @@ index 76cc877..f59613e 100644
 +#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
  #include <sys/mman.h>
  #endif
-+#if defined(__linux__)
++#if defined(__linux__) && !defined(__ANDROID__)
 +#include <dlfcn.h>
 +#include <execinfo.h>
 +#endif
@@ -4511,7 +4511,7 @@ index 76cc877..f59613e 100644
 +      REXSYS_ERROR("  guest lr 0x{:08X} sp 0x{:08X} r3 0x{:08X} r31 0x{:08X}", uint32_t(ctx->lr), ctx->r1.u32,
 +                   ctx->r3.u32, ctx->r31.u32);
 +    }
-+#if defined(__linux__)
++#if defined(__linux__) && !defined(__ANDROID__)
 +    // The host frames (module + offset, symbolize with addr2line/nm): which generated functions.
 +    void* frames[32];
 +    int n = backtrace(frames, 32);

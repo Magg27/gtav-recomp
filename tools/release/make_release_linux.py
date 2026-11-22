@@ -58,6 +58,7 @@ FILES = [
     # Game library build inputs: our freestanding header and CRT, the hook list, the export list.
     (REPO / "gtav" / "fs" / "gtav_pch.h", "tools/game_dll/fs/gtav_pch.h", False),
     (REPO / "gtav" / "fs" / "layout_check.h", "tools/game_dll/fs/layout_check.h", False),
+    (REPO / "gtav" / "fs" / "gprlr_inline.h", "tools/game_dll/fs/gprlr_inline.h", False),
     (REPO / "gtav" / "fs" / "game_dll.cpp", "tools/game_dll/fs/game_dll.cpp", False),
     (REPO / "gtav" / "fs" / "fs_crt.cpp", "tools/game_dll/fs/fs_crt.cpp", False),
     (REPO / "gtav" / "fs" / "include" / "stdlib.h", "tools/game_dll/fs/include/stdlib.h", False),
@@ -186,8 +187,7 @@ def main():
         # own libgtav_fast.so / librexruntime.so to link against, interface lists and simde; built
         # on Linux by tools/android/make_shell.sh, copied as it is.
         android = Path(a.android)
-        for f in ("GTAV.apk", "link/libgtav_fast.so", "link/librexruntime.so", "interface/gtav_game.exports",
-                  "interface/gtav_hooks.h", "include/simde/x86/sse4.1.h", "LICENSES/simde.txt"):
+        for f in ("GTAV.apk", "LICENSES/simde.txt", "LICENSES/LLVM.txt", "LICENSES/DirectXShaderCompiler.txt"):
             if not (android / f).is_file():
                 sys.exit(f"--android: missing {f}")
         shutil.copytree(android, out / "android")

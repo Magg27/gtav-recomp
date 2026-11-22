@@ -1,17 +1,15 @@
 #!/bin/bash
 # The Android part of every desktop release (the package's android/ folder): the public APK with
-# no game code, plus what the Android step (loader/src/install.cpp RunAndroid, on Windows, Linux or
-# macOS) needs to build the player's libgtav_game.so for it with the bundled clang + lld:
+# no game code. Since v0.5.0 it holds the tools to set the game up on the phone itself (codegen,
+# clang, lld, XenosRecomp, dxc and the build kit, see build_apk.sh), so the desktop step only
+# carries the APK and the licenses of what it adds:
 #   OUT_DIR/GTAV.apk             the app: SDL + setup screen, libmain.so (shim), libgtav_fast.so,
-#                                the SDK runtime; no game code, data or shaders
-#   OUT_DIR/link/                libgtav_fast.so, librexruntime.so: byte for byte the APK's own
-#                                (the game library links against them; pack.txt names the hash)
-#   OUT_DIR/interface/           gtav_hooks.h, gtav_game.exports (names only)
-#   OUT_DIR/include/simde/       simde (MIT): SSE intrinsics on NEON for the generated code
-#   OUT_DIR/LICENSES/            simde, SDL, libc++ (what the APK adds to the desktop package)
+#                                the SDK runtime, the build tools; no game code, data or shaders
+#   OUT_DIR/LICENSES/            simde, SDL, libc++, LLVM, DirectXShaderCompiler, XenosRecomp
 #   tools/android/make_shell.sh OUT_DIR
 # Inputs: build/android-dll (tools/android/build_game.sh layout with -DGTAV_GAME_DLL=ON, see
-# docs/ANDROID_STATUS.md) and the Android SDK install (tools/android/build_sdk.sh).
+# docs/ANDROID_STATUS.md), the Android SDK install (tools/android/build_sdk.sh) and the phone
+# tools (build_llvm.sh, build_dxc.sh, build_xr.sh).
 set -euo pipefail
 R="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT=$1
@@ -28,15 +26,11 @@ defined=$("$NM" -D --defined-only "$DLL/libgtav_fast.so" | grep -c -E " __imp__s
 RELEASE=1 "$R/tools/android/build_apk.sh" >/dev/null
 APK=$R/build/android/apk/gtav-recomp-release.apk
 rm -rf "$OUT/link" "$OUT/interface" "$OUT/include" "$OUT/LICENSES" "$OUT/GTAV.apk"
-mkdir -p "$OUT/link" "$OUT/interface" "$OUT/include" "$OUT/LICENSES"
+mkdir -p "$OUT/LICENSES"
 cp "$APK" "$OUT/GTAV.apk"
-# The link inputs straight out of the APK, so the pack's hash matches what the phone has.
-unzip -q -j -o "$APK" lib/arm64-v8a/libgtav_fast.so lib/arm64-v8a/librexruntime.so -d "$OUT/link"
-for f in "$OUT/link"/*.so; do
-  if strings "$f" | grep -q "$R"; then echo "note: build path in $(basename "$f") (debug strings)"; fi
-done
-cp "$DLL/game_interface/gtav_hooks.h" "$DLL/game_interface/gtav_game.exports" "$OUT/interface/"
-rsync -a --exclude='*.md' --exclude='*.txt' --exclude='.*' "$R/rexglue-sdk/thirdparty/simde/simde/" "$OUT/include/simde/"
 cp "$R/rexglue-sdk/thirdparty/simde/COPYING" "$OUT/LICENSES/simde.txt"
 cp "$R/rexglue-sdk/thirdparty/sdl3/LICENSE.txt" "$OUT/LICENSES/SDL.txt"
+cp "$R/build/android-llvm/llvm-project-19.1.5.src/llvm/LICENSE.TXT" "$OUT/LICENSES/LLVM.txt"
+cp "$R/build/android-dxc/out/LICENSE-dxc.txt" "$OUT/LICENSES/DirectXShaderCompiler.txt"
+cp "$R/thirdparty/XenosRecomp/LICENSE.md" "$OUT/LICENSES/XenosRecomp.md"
 echo "android: $OUT ($(du -sh "$OUT" | cut -f1); APK $(du -sh "$OUT/GTAV.apk" | cut -f1))"

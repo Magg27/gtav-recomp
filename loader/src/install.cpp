@@ -42,11 +42,12 @@ extern char** environ;
 #endif
 // The iPhone app's setup screen uses the copy stages only (RunDataInstall): iOS cannot start
 // processes, so nothing here that spawns one (codegen, clang, the game) runs there.
-#if (defined(__APPLE__) && TARGET_OS_IPHONE) || defined(__ANDROID__)
-// Android (the APK's setup screen, libgtav_setup.so): RunDataInstall only, like the iPhone; bionic
-// also lacks posix_spawn_file_actions_addchdir_np before API 34.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
 #define LOADER_NO_SPAWN 1
 #endif
+// Android (the APK's setup screen, libgtav_setup.so): the data install and the on-phone game build
+// (RunAndroidOnDevice: codegen, clang, lld from the APK's native library folder). Bionic lacks
+// posix_spawn_file_actions_addchdir_np before API 34, so Child forks and execs itself there.
 
 #include <algorithm>
 #include <array>
@@ -472,11 +473,41 @@ struct Child {
 #endif
     std::vector<std::string> narrow = NarrowArgs(args);
     std::vector<char*> argv = Argv(narrow);
+#ifdef __ANDROID__
+    {
+      // Everything the child needs is made before fork: between fork and exec only
+      // async-signal-safe calls (the app process has many threads).
+      const std::string log_s = log.string(), cwd_s = cwd.string();
+      // The tools live in the APK's library folder with the shared libraries some of them need
+      // (libc++_shared.so): a started program does not get the app's linker namespace.
+      std::vector<std::string> env_s;
+      for (char** e = environ; *e; ++e)
+        if (std::strncmp(*e, "LD_LIBRARY_PATH=", 16) != 0) env_s.push_back(*e);
+      env_s.push_back("LD_LIBRARY_PATH=" + fs::path(narrow[0]).parent_path().string());
+      std::vector<char*> envp;
+      for (std::string& e : env_s) envp.push_back(e.data());
+      envp.push_back(nullptr);
+      pid = fork();
+      if (pid == 0) {
+        int fd = open(log_s.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+          dup2(fd, 1);
+          dup2(fd, 2);
+        }
+        if (chdir(cwd_s.c_str()) != 0) _exit(126);
+        execve(argv[0], argv.data(), envp.data());
+        _exit(127);
+      }
+      if (pid < 0) return false;
+      setpriority(PRIO_PROCESS, id_t(pid), 10);
+      return true;
+    }
+#endif
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_addopen(&fa, 1, log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     posix_spawn_file_actions_adddup2(&fa, 1, 2);
-#ifndef LOADER_NO_SPAWN
+#if !defined(LOADER_NO_SPAWN) && !defined(__ANDROID__)
     posix_spawn_file_actions_addchdir_np(&fa, cwd.c_str());
 #endif
     int err = posix_spawn(&pid, argv[0], &fa, nullptr, argv.data(), environ);
@@ -662,7 +693,7 @@ class Installer {
     if (!Codegen() || !CheckGenerated() || !Compile() || !Link()) return Fail();
 
     std::ofstream(home_ / kInstalledMarker) << kInstallVersion << "\n";
-    fs::remove_all(data_ / L"build", ec);
+    fs::remove_all(BuildDir(), ec);
     fs::remove(data_ / L"install_state.txt", ec);
     ui_.Progress(1.0);
     ui_.Stage(L"Done. Press Play.");
@@ -990,7 +1021,7 @@ class Installer {
   //--- codegen ---------------------------------------------------------------
 
   bool Codegen() {
-    fs::path build = data_ / L"build";
+    fs::path build = BuildDir();
     fs::path gen = build / L"generated" / L"default";
     fs::path tools = root_ / L"tools" / L"game_dll";
     std::error_code ec;
@@ -1013,7 +1044,8 @@ class Installer {
     Log(L"Running codegen");
     fs::path log = data_ / L"logs" / L"codegen.log";
     Child c;
-    Args cmd = {(root_ / kCodegenExe).wstring(), L"--log-level", L"info", L"codegen",
+    Args cmd = {(device_tools_.empty() ? root_ / kCodegenExe : device_tools_ / L"librexglue_exe.so").wstring(),
+                L"--log-level", L"info", L"codegen",
                 L"gtav_manifest.toml"};
     if (!c.Start(cmd, build, log)) return SetError(L"Could not start " + std::wstring(kCodegenExe));
     size_t want = expected_.gen.size();
@@ -1042,7 +1074,7 @@ class Installer {
 
   bool CheckGenerated() {
     ui_.Stage(L"Checking the generated code...");
-    fs::path gen = data_ / L"build" / L"generated" / L"default";
+    fs::path gen = BuildDir() / L"generated" / L"default";
     size_t n = 0, bad = 0;
     std::wstring first_bad;
     for (auto& [name, exp] : expected_.gen) {
@@ -1095,7 +1127,13 @@ class Installer {
       }
       mi.ignore(64, '\n');
     }
+#ifdef __ANDROID__
+    // On the phone clang needs ~150 MB for an average generated file (measured on an S23 FE:
+    // 10 s, 133 MB): every core, keeping 1.5 GB for the app and the system.
+    int64_t by_ram_mb = (avail_mb - 1536) / 384;
+#else
     int64_t by_ram_mb = (avail_mb - 2048) / 1024;
+#endif
     int jobs_mb = int(std::min<int64_t>(sysconf(_SC_NPROCESSORS_ONLN), by_ram_mb));
     return std::clamp(jobs_mb, 1, 32);
 #endif
@@ -1112,8 +1150,8 @@ class Installer {
   }
 
   bool Compile() {
-    fs::path gen = data_ / L"build" / L"generated" / L"default";
-    fs::path obj = data_ / L"build" / (ios_ ? L"obj_ios" : android_ ? L"obj_android" : L"obj");
+    fs::path gen = BuildDir() / L"generated" / L"default";
+    fs::path obj = BuildDir() / (ios_ ? L"obj_ios" : android_ ? L"obj_android" : L"obj");
     fs::path fsdir = root_ / L"tools" / L"game_dll" / L"fs";
     // iPhone / Android: the phone shell's own hook header (package ios/ or android/ interface).
     fs::path iface = ios_       ? root_ / L"ios" / L"interface"
@@ -1138,6 +1176,7 @@ class Installer {
 #endif
 
     fs::path clang = root_ / L"tools" / L"llvm" / L"bin" / kClang;
+    if (!device_tools_.empty()) clang = device_tools_ / L"libclang_exe.so";
     // Keep in sync with tools/game_dll/build_game_dll.py.
     Args flags;
     if (ios_) {
@@ -1175,6 +1214,12 @@ class Installer {
 #endif
     }
     flags.insert(flags.end(), {L"-isystem", (fsdir / L"include").wstring(), L"-I", gen.wstring()});
+    if (!device_tools_.empty()) {
+      // On the phone clang runs from the APK's library folder under another name: C++ by flag, and
+      // its own headers (stddef.h, arm_neon.h) from the kit, not from <exe>/../lib/clang.
+      flags.insert(flags.begin(), L"--driver-mode=g++");
+      flags.insert(flags.end(), {L"-resource-dir", (root_ / L"android" / L"clang").wstring()});
+    }
 
     int jobs = JobCount();
     Log(L"Compiling " + Num(sources.size()) + L" files with " + Num(jobs) + L" parallel jobs");
@@ -1195,6 +1240,15 @@ class Installer {
         Running r{std::make_unique<Child>(), obj / (src.filename().wstring() + L".log"), src};
         Args cmd = {clang.wstring()};
         cmd.insert(cmd.end(), flags.begin(), flags.end());
+        // Generated sources: __savegprlr/__restgprlr inline at every call (fs/gprlr_inline.h, ~3%
+        // faster main thread). Not for Apple targets: Mach-O has no overridable alias.
+#ifdef __APPLE__
+        const bool apple_target = !android_;
+#else
+        const bool apple_target = ios_;
+#endif
+        if (!apple_target && src.parent_path() == gen)
+          cmd.insert(cmd.end(), {L"-include", (fsdir / L"gprlr_inline.h").wstring()});
         cmd.insert(cmd.end(), {L"-c", src.wstring(), L"-o", o.wstring()});
         if (!r.child->Start(cmd, gen, r.log)) return SetError(L"Could not start " + std::wstring(kClang));
         running.push_back(std::move(r));
@@ -1286,7 +1340,7 @@ class Installer {
 
     ui_.Stage(L"Packing GTAV.ipa...");
     if (!WriteIpa(out / L"Payload", out / L"GTAV.ipa")) return SetError(L"Could not write " + (out / L"GTAV.ipa").wstring());
-    fs::remove_all(data_ / L"build", ec);
+    fs::remove_all(BuildDir(), ec);
     Log(L"---- iPhone build finished: " + (out / L"GTAV.ipa").wstring());
     ui_.Progress(1.0);
     ui_.Stage(L"Done: iphone/GTAV.ipa in the game folder. Install it with Sideloadly or AltStore.");
@@ -1319,6 +1373,14 @@ class Installer {
     fs::create_directories(data_ / L"logs", ec);
     log_.open(data_ / L"logs" / L"android.log", std::ios::app);
     Log(L"---- Android build");
+    // Since v0.5.0 the Android app builds the game on the phone from the player's discs, with the
+    // tools inside the APK, exactly like this installer: there is nothing to make here any more.
+    if (!fs::exists(root_ / L"android" / L"link" / L"libgtav_fast.so", ec)) {
+      ui_.Progress(1.0);
+      return SetError(L"Nothing to build here: the Android app sets the game up by itself now. Copy "
+                      L"android/GTAV.apk from this download to the phone, install it, copy your disc images "
+                      L"and title update there and press Install in the app.");
+    }
     if (!IsInstalled(home_))
       return SetError(L"Set up the game on this computer first (Install), then build for Android.");
     const fs::path pkg = root_ / L"android";
@@ -1369,7 +1431,7 @@ class Installer {
       fs::copy_file(apk, out / L"GTAV.apk", fs::copy_options::overwrite_existing, ec);
       if (ec) return SetError(L"Could not copy GTAV.apk next to the pack: " + Widen(ec.message()));
     }
-    fs::remove_all(data_ / L"build", ec);
+    fs::remove_all(BuildDir(), ec);
     Log(L"---- Android build finished: " + zip.wstring());
     ui_.Progress(1.0);
     ui_.Stage(L"Done: android/gtav-android-pack.zip in the game folder. Copy it and your disc files to the "
@@ -1383,7 +1445,7 @@ class Installer {
   // the same dlopen'd tree. Every package's lld is one multi-format binary: -flavor gnu = ld.lld.
   bool LinkAndroid(const fs::path& out) {
     ui_.Stage(L"Linking libgtav_game.so for Android...");
-    fs::path build = data_ / L"build";
+    fs::path build = BuildDir();
     fs::path pkg = root_ / L"android";
     fs::path rsp = build / L"link_android.rsp";
     {
@@ -1399,8 +1461,11 @@ class Installer {
 #elif defined(__APPLE__)
     const fs::path lld = root_ / L"tools" / L"llvm" / L"bin" / L"ld64.lld";
 #else
-    const fs::path lld = root_ / L"tools" / L"llvm" / L"bin" / L"ld.lld";
+    const fs::path lld = device_tools_.empty() ? root_ / L"tools" / L"llvm" / L"bin" / L"ld.lld"
+                                               : device_tools_ / L"liblld_exe.so";
 #endif
+    // On the phone the link inputs are the installed app's own libraries.
+    const fs::path link = device_tools_.empty() ? pkg / L"link" : device_tools_;
     auto gen = [](const fs::path& p) { return p.generic_wstring(); };
     fs::path tmp = out;
     tmp += ".new";
@@ -1408,7 +1473,7 @@ class Installer {
                 L"-z", L"now", L"-z", L"relro", L"-z", L"noexecstack", L"-z", L"max-page-size=16384",
                 L"--hash-style=gnu", L"-O1",
                 L"--version-script=" + gen(pkg / L"interface" / L"gtav_game.exports"), L"-o", gen(tmp),
-                L"@" + gen(rsp), gen(pkg / L"link" / L"libgtav_fast.so"), gen(pkg / L"link" / L"librexruntime.so")};
+                L"@" + gen(rsp), gen(link / L"libgtav_fast.so"), gen(link / L"librexruntime.so")};
     Child c;
     if (!c.Start(cmd, build, log)) return SetError(L"Could not start ld.lld");
     if (c.Poll(INFINITE) != 0) return SetError(L"Linking failed:\n" + Widen(Tail(log, 1500)));
@@ -1421,7 +1486,7 @@ class Installer {
 
   bool LinkIphone(const fs::path& out) {
     ui_.Stage(L"Linking gtav_game.dylib for iPhone...");
-    fs::path build = data_ / L"build";
+    fs::path build = BuildDir();
     fs::path ios = root_ / L"ios";
     fs::path rsp = build / L"link_ios.rsp";
     {
@@ -1485,7 +1550,7 @@ class Installer {
 #else
     const wchar_t *kXr = L"XenosRecomp", *kDxc = L"dxc";
 #endif
-    const fs::path work = data_ / L"build" / (android ? L"spirv_android" : L"spirv_ios");
+    const fs::path work = BuildDir() / (android ? L"spirv_android" : L"spirv_ios");
     const fs::path phone_cache = home_ / (android ? L"android" : L"iphone") / L"shader_cache";
     std::error_code ec;
     fs::create_directories(spirv, ec);
@@ -1623,7 +1688,7 @@ class Installer {
 #ifdef __APPLE__
   bool Link() {
     ui_.Stage(L"Linking gtav_game.dylib...");
-    fs::path build = data_ / L"build";
+    fs::path build = BuildDir();
     fs::path gd = root_ / L"tools" / L"game_dll";
     fs::path lld = root_ / L"tools" / L"llvm" / L"bin" / L"ld64.lld";
     fs::path rsp = build / L"link.rsp";
@@ -1657,7 +1722,7 @@ class Installer {
 #elif !defined(_WIN32)
   bool Link() {
     ui_.Stage(L"Linking gtav_game.so...");
-    fs::path build = data_ / L"build";
+    fs::path build = BuildDir();
     fs::path iface = root_ / L"tools" / L"game_dll" / L"interface";
     fs::path lld = root_ / L"tools" / L"llvm" / L"bin" / L"ld.lld";
     fs::path rsp = build / L"link.rsp";
@@ -1687,7 +1752,7 @@ class Installer {
 #else
   bool Link() {
     ui_.Stage(L"Linking gtav_game.dll...");
-    fs::path build = data_ / L"build";
+    fs::path build = BuildDir();
     fs::path iface = root_ / L"tools" / L"game_dll" / L"interface";
     fs::path lld = root_ / L"tools" / L"llvm" / L"bin" / L"lld-link.exe";
     std::vector<fs::path> libs;
@@ -1740,6 +1805,37 @@ class Installer {
   uint64_t copy_total_ = 0, copied_ = 0;
   bool ios_ = false;      // RunIphone: Compile for arm64 iOS
   bool android_ = false;  // RunAndroid: Compile for aarch64 Android
+  fs::path device_tools_;  // RunAndroidOnDevice: the APK's native library folder (tools + link inputs)
+  fs::path build_dir_;     // RunAndroidOnDevice: app-private build folder (not FUSE external storage)
+  fs::path BuildDir() const { return build_dir_.empty() ? data_ / L"build" : build_dir_; }
+
+ public:
+  // The Android app builds the player's game library on the phone: the same codegen, reference
+  // check, compile and link as Build for Android on a PC, with the tools the APK carries.
+  bool RunAndroidOnDevice(const fs::path& tools, const fs::path& build, const fs::path& out_lib,
+                          std::wstring* error) {
+    error_ = error;
+    android_ = true;
+    device_tools_ = tools;
+    build_dir_ = build;
+    std::error_code ec;
+    fs::create_directories(data_ / L"logs", ec);
+    log_.open(data_ / L"logs" / L"build.log", std::ios::app);
+    Log(L"---- game build on this phone");
+    for (const fs::path f : {tools / L"librexglue_exe.so", tools / L"libclang_exe.so", tools / L"liblld_exe.so",
+                             tools / L"libgtav_fast.so", tools / L"librexruntime.so"}) {
+      if (!fs::exists(f, ec)) return SetError(L"This app is missing " + f.filename().wstring() + L".");
+    }
+    if (!expected_.Load(root_ / L"tools" / L"game_dll" / L"expected.txt", error)) return false;
+    fs::remove_all(BuildDir(), ec);
+    fs::create_directories(BuildDir(), ec);
+    if (!Codegen() || !CheckGenerated() || !Compile()) return Fail();
+    if (!LinkAndroid(out_lib)) return Fail();
+    fs::remove_all(BuildDir(), ec);
+    Log(L"---- game build finished");
+    ui_.Progress(1.0);
+    return true;
+  }
 };
 
 }  // namespace
@@ -1753,6 +1849,12 @@ bool RunDataInstall(const fs::path& home, const fs::path& expected, const Instal
 bool AdoptCopiedData(const fs::path& home, const fs::path& expected, InstallUi& ui, std::wstring* error) {
   Installer inst(home, home, InstallInputs{}, ui);
   return inst.RunAdopt(expected, error);
+}
+
+bool RunAndroidOnDevice(const fs::path& kit, const fs::path& tools, const fs::path& home, const fs::path& build,
+                        const fs::path& out_lib, InstallUi& ui, std::wstring* error) {
+  Installer inst(kit, home, InstallInputs{}, ui);
+  return inst.RunAndroidOnDevice(tools, build, out_lib, error);
 }
 
 bool IsDataInstalled(const fs::path& home) {

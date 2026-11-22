@@ -34,7 +34,7 @@ cmake -S "$SRC/llvm" -B "$W/android" -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
   -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-30 -DANDROID_STL=c++_static \
   -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_PROJECTS="clang;lld" \
-  -DLLVM_TARGETS_TO_BUILD=AArch64 -DLLVM_DEFAULT_TARGET_TRIPLE=aarch64-linux-android30 \
+  -DLLVM_TARGETS_TO_BUILD=AArch64 -DLLVM_DEFAULT_TARGET_TRIPLE=aarch64-linux-android30 -DLLVM_APPEND_VC_REV=OFF \
   -DLLVM_HOST_TRIPLE=aarch64-linux-android \
   -DLLVM_TABLEGEN="$W/host/bin/llvm-tblgen" -DCLANG_TABLEGEN="$W/host/bin/clang-tblgen" \
   -DLLVM_NATIVE_TOOL_DIR="$W/host/bin" \

@@ -129,7 +129,11 @@ def main():
         t = time.time()
         # clang-19 is the one binary in the bundled LLVM; it acts as clang++ with --driver-mode.
         drv = ["--driver-mode=g++"] if os.path.basename(clang).startswith("clang-") else []
-        r = subprocess.run([clang] + drv + cxxflags + inc + ["-c", src, "-o", obj],
+        # Generated sources: the CRT register save/restore helpers inline (fs/gprlr_inline.h);
+        # not on Apple targets (Mach-O has no overridable alias). Keep in sync with install.cpp.
+        pre = ["-include", os.path.join(FS, "gprlr_inline.h")] \
+            if (android or not MACOS) and os.path.dirname(src) == a.generated else []
+        r = subprocess.run([clang] + drv + cxxflags + inc + pre + ["-c", src, "-o", obj],
                            capture_output=True, text=True)
         return (obj if r.returncode == 0 else None), time.time() - t, r.stderr[-2000:]
 

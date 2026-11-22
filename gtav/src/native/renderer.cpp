@@ -56,7 +56,7 @@
 #endif
 
 REXCVAR_DEFINE_STRING(gtav_native, "off", "GTAV", "Native renderer: off | shadow | on");
-REXCVAR_DEFINE_BOOL(gtav_native_vsync, true, "GTAV", "Native renderer: wait for vertical sync when presenting");
+REXCVAR_DEFINE_BOOL(gtav_native_vsync, false, "GTAV", "Native renderer: wait for vertical sync when presenting (off by default: uncapped)");
 REXCVAR_DEFINE_BOOL(gtav_native_exact_barriers, true, "GTAV",
                     "Native renderer: no TOP_OF_PIPE / BOTTOM_OF_PIPE next to other barrier stages (MoltenVK waits less)");
 #ifdef __ANDROID__

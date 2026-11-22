@@ -34,6 +34,20 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#ifdef __ANDROID__
+// The phone translates its shaders itself, like the desktop: XenosRecomp and dxc come in the APK's
+// native library folder (the only place an app may execute files from), plus the Adreno fixes the
+// PC's Build for Android used to apply (uniform-buffer constants, no 64-bit integers).
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <cerrno>
+#include <iterator>
+#include <spawn.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include "adreno_shader_fix.h"
+extern char** environ;
+#endif
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
@@ -79,7 +93,29 @@ std::deque<Intake> g_intake;
 std::condition_variable g_intake_cv;
 bool g_intake_started = false;
 
+#ifdef __ANDROID__
+// The folder this library was loaded from (the APK's native library folder).
+fs::path ToolsDir() {
+  Dl_info info{};
+  if (dladdr(reinterpret_cast<void*>(&CompileGeneration), &info) && info.dli_fname)
+    return fs::path(info.dli_fname).parent_path();
+  return {};
+}
+fs::path XenosRecompPath() { return ToolsDir() / "libxenosrecomp_exe.so"; }
+fs::path DxcPath() { return ToolsDir() / "libdxc_exe.so"; }
+// Written by the setup screen from the APK's kit (XenosRecomp's header with the Adreno edits).
+fs::path ShaderCommonPath() { return ExeDir() / "tools" / "shader_common.h"; }
+#else
 fs::path ToolsDir() { return ExeDir() / "tools"; }
+#ifdef _WIN32
+fs::path XenosRecompPath() { return ToolsDir() / "XenosRecomp.exe"; }
+fs::path DxcPath() { return ToolsDir() / "dxc.exe"; }
+#else
+fs::path XenosRecompPath() { return ToolsDir() / "XenosRecomp"; }
+fs::path DxcPath() { return ToolsDir() / "dxc"; }
+#endif
+fs::path ShaderCommonPath() { return ToolsDir() / "shader_common.h"; }
+#endif
 fs::path SpirvDirPath() {
   const std::string& dir = REXCVAR_GET(gtav_native_spirv_dir);
   return dir.empty() ? fs::path(DefaultSpirvDir()) : fs::path(dir);
@@ -113,6 +149,31 @@ bool Run(const std::vector<std::string>& args) {
 #elif defined(__APPLE__) && TARGET_OS_IPHONE
   (void)args;
   return false;
+#elif defined(__ANDROID__)
+  std::vector<char*> argv;
+  for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+  argv.push_back(nullptr);
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+  posix_spawn_file_actions_adddup2(&fa, 1, 2);
+  // The tools' shared libraries (libdxcompiler.so) are next to them, in the APK's library folder.
+  std::vector<std::string> env_s;
+  for (char** e = environ; *e; ++e)
+    if (std::strncmp(*e, "LD_LIBRARY_PATH=", 16) != 0) env_s.push_back(*e);
+  env_s.push_back("LD_LIBRARY_PATH=" + ToolsDir().string());
+  std::vector<char*> envp;
+  for (std::string& e : env_s) envp.push_back(e.data());
+  envp.push_back(nullptr);
+  pid_t pid = -1;
+  int err = posix_spawn(&pid, argv[0], &fa, nullptr, argv.data(), envp.data());
+  posix_spawn_file_actions_destroy(&fa);
+  if (err != 0) return false;
+  setpriority(PRIO_PROCESS, id_t(pid), 5);  // below the game's threads
+  int st = 0;
+  while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {
+  }
+  return WIFEXITED(st) && WEXITSTATUS(st) == 0;
 #else
   std::string cmd = "nice -n 5 ";  // below the game's threads, like BELOW_NORMAL on Windows
   if (const char* cpus = gtav::linux_threads::BackgroundCpuList(); cpus && *cpus) cmd += std::string("taskset -c ") + cpus + " ";
@@ -124,19 +185,32 @@ bool Run(const std::vector<std::string>& args) {
 
 // HLSL -> <spirv>/<name>.spv with the same DXC arguments as the offline census.
 bool CompileHlsl(const fs::path& hlsl, const std::string& name, bool pixel) {
-  const fs::path tools = ToolsDir(), spirv = SpirvDirPath();
+  const fs::path spirv = SpirvDirPath();
   const fs::path tmp = spirv / (name + ".spv.tmp"), out = spirv / (name + ".spv");
-#ifdef _WIN32
-  const fs::path dxc = tools / "dxc.exe";
-#else
-  const fs::path dxc = tools / "dxc";
-#endif
+  const fs::path dxc = DxcPath();
   std::vector<std::string> args = {dxc.string(), "-T", pixel ? "ps_6_0" : "vs_6_0", "-HV", "2021",
                                    "-all-resources-bound", "-spirv", "-fvk-use-dx-layout",
                                    "-Wno-ignored-attributes", "-Qstrip_debug"};
   if (!pixel) args.push_back("-fvk-invert-y");
   args.insert(args.end(), {"-Fo", tmp.string(), hlsl.string()});
   if (!Run(args)) return false;
+#ifdef __ANDROID__
+  {
+    // No shaderInt64 on Adreno (Vulkan 1.1): 64-bit integers -> uvec2.
+    std::ifstream f(tmp, std::ios::binary);
+    std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    f.close();
+    std::vector<uint32_t> words(bytes.size() / 4);
+    if (!words.empty()) std::memcpy(words.data(), bytes.data(), words.size() * 4);
+    std::string err;
+    if (words.empty() || !gtav::adreno::LowerInt64(words, &err)) {
+      REXLOG_WARN("[native] shader {}: lower_int64: {}", name, err);
+      return false;
+    }
+    std::ofstream(tmp, std::ios::binary | std::ios::trunc)
+        .write(reinterpret_cast<const char*>(words.data()), std::streamsize(words.size() * 4));
+  }
+#endif
   // Vertex shaders with computed-index fetches need the raw streams (see Backend::Shader).
   if (!pixel) {
     std::ifstream f(hlsl);
@@ -215,16 +289,26 @@ bool CompileVariants(const std::string& name, const fs::path& hlsl) {
 }
 
 bool Compile(const std::string& name) {
-  const fs::path tools = ToolsDir(), cache = CacheDir();
+  const fs::path cache = CacheDir();
   const bool pixel = name.rfind("ps_", 0) == 0;
   const fs::path bin = cache / (name + ".bin"), hlsl = cache / (name + ".hlsl");
-#ifdef _WIN32
-  const fs::path xr = tools / "XenosRecomp.exe";
-#else
-  const fs::path xr = tools / "XenosRecomp";
-#endif
-  if (!Run({xr.string(), bin.string(), hlsl.string(), (tools / "shader_common.h").string()}) || !fs::exists(hlsl))
+  if (!Run({XenosRecompPath().string(), bin.string(), hlsl.string(), ShaderCommonPath().string()}) ||
+      !fs::exists(hlsl))
     return false;
+#ifdef __ANDROID__
+  {
+    // Every shader's constants from uniform buffers (the Adreno path, as the PC pack made them).
+    std::ifstream f(hlsl, std::ios::binary);
+    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    f.close();
+    std::string err;
+    if (!gtav::adreno::UboConstants(text, &err)) {
+      REXLOG_WARN("[native] shader {}: ubo constants: {}", name, err);
+      return false;
+    }
+    std::ofstream(hlsl, std::ios::binary | std::ios::trunc) << text;
+  }
+#endif
   // Variants first: the backend retries every missing shader once the base .spv appears.
   if (!CompileVariants(name, hlsl)) return false;
   return CompileHlsl(hlsl, name, pixel);
@@ -297,11 +381,7 @@ ShaderStats GetShaderStats() {
   s.compiled_this_run = g_ok.load();
   s.pending = g_pending.load();
   std::error_code ec;
-#ifdef _WIN32
-  s.can_compile = REXCVAR_GET(gtav_native_compile) && fs::exists(ToolsDir() / "dxc.exe", ec);
-#else
-  s.can_compile = REXCVAR_GET(gtav_native_compile) && fs::exists(ToolsDir() / "dxc", ec);
-#endif
+  s.can_compile = REXCVAR_GET(gtav_native_compile) && fs::exists(DxcPath(), ec);
   s.failed.assign(g_failed_names.begin(), g_failed_names.end());
   for (const auto& name : g_missing_at_draw)
     if (!g_present.count(name)) s.missing_at_draw.push_back(name);

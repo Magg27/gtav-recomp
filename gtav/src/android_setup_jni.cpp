@@ -1,5 +1,5 @@
 // gtav - libgtav_setup.so: the Android app's setup screen (SetupActivity.java) runs the game data
-// install here, the same code the desktop and iPhone installers use (loader/src/install.cpp
+// install and the on-phone game build here, the same code the desktop and iPhone installers use (loader/src/install.cpp
 // RunDataInstall: Disc 2 + TU27 + the Disc 1 install partitions, every file checked against the
 // pack's expected.txt, resumable). This library has no game code and no dependency on it: it loads
 // before the player's libgtav_game.so exists.
@@ -94,6 +94,20 @@ JNIEXPORT jstring JNICALL Java_com_gtavrecomp_app_SetupActivity_nativeAdopt(JNIE
                               &error))
     return nullptr;
   return env->NewStringUTF(N(error.empty() ? std::wstring(L"The check stopped.") : error).c_str());
+}
+
+// The game library, built here from the installed game (codegen, clang and lld from the APK's
+// native library folder). null when out_lib is in place.
+JNIEXPORT jstring JNICALL Java_com_gtavrecomp_app_SetupActivity_nativeBuildGame(JNIEnv* env, jobject self, jstring kit,
+                                                                               jstring tools, jstring home,
+                                                                               jstring build, jstring out_lib) {
+  JavaUi ui(env, self);
+  std::wstring error;
+  namespace fs = std::filesystem;
+  if (loader::RunAndroidOnDevice(fs::path(W(env, kit)), fs::path(W(env, tools)), fs::path(W(env, home)),
+                                 fs::path(W(env, build)), fs::path(W(env, out_lib)), ui, &error))
+    return nullptr;
+  return env->NewStringUTF(N(error.empty() ? std::wstring(L"The game build stopped.") : error).c_str());
 }
 
 JNIEXPORT jboolean JNICALL Java_com_gtavrecomp_app_SetupActivity_nativeIsDataInstalled(JNIEnv* env, jclass,

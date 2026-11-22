@@ -26,7 +26,7 @@
 #include <timeapi.h>
 #endif
 
-REXCVAR_DEFINE_INT32(gtav_fps_limit, 30, "GTAV",
+REXCVAR_DEFINE_INT32(gtav_fps_limit, 0, "GTAV",
                      "Frame-rate limit: 30 = the game's own limiter, 0 = uncapped, other = that rate");
 REXCVAR_DEFINE_BOOL(gtav_vehicle_30fps, false, "GTAV",
                     "In vehicles, run at the Xbox's 30 fps (the game's own limiter): the driving and flying "
