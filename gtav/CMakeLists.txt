@@ -112,6 +112,19 @@ elseif(ANDROID)
     # adreno_shader_fix.cpp: the on-phone shader translation (shader_compiler.cpp) applies the
     # Adreno fixes itself now.
     target_sources(gtav PRIVATE src/android_threads.cpp src/native/adreno_shader_fix.cpp)
+    # The int64 lowering (adreno_shader_fix.cpp LowerInt64) needs SPIRV-Tools (static, from the
+    # SDK's thirdparty tree), as in the desktop launcher's phone builds.
+    set(_gtav_tp ${CMAKE_CURRENT_SOURCE_DIR}/../rexglue-sdk/thirdparty)
+    if(NOT TARGET SPIRV-Tools-static)
+        set(SPIRV-Headers_SOURCE_DIR ${_gtav_tp}/spirv-headers)
+        set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
+        set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
+        set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
+        set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)
+        add_subdirectory(${_gtav_tp}/spirv-tools spirv-tools EXCLUDE_FROM_ALL)
+    endif()
+    target_compile_definitions(gtav PRIVATE GTAV_HAVE_SPIRV_TOOLS=1)
+    target_link_libraries(gtav PRIVATE SPIRV-Tools-static)
     target_link_options(gtav PRIVATE -Wl,--wrap=pthread_create)
 else()
     add_executable(gtav ${GTAV_SOURCES})

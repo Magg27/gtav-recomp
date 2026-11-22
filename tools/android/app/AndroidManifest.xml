@@ -26,6 +26,7 @@
         android:hasCode="true"
         android:largeHeap="true"
         android:hardwareAccelerated="true"
+        android:allowNativeHeapPointerTagging="false"
         android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
         <activity
             android:name="com.gtavrecomp.app.SetupActivity"
