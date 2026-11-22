@@ -98,6 +98,8 @@ bool g_drivelog = false;  // "drivelog" debug command
 // "drivetest": 1 = teleported to the airport tarmac, waiting for the map + model; 2 = in the car.
 int g_drivetest = 0;
 std::chrono::steady_clock::time_point g_drivetest_at{};
+bool g_drive_here = false;
+float g_drive_pos[4] = {};  // x, y, z, heading of the car
 constexpr float kDriveX = -1336.0f, kDriveY = -3044.0f, kDriveZ = 13.9f, kDriveHeading = 150.0f;
 
 using rex::input::mnk::InputContext;
@@ -476,7 +478,18 @@ REX_HOOK_RAW(sub_82CE9CA8) {
           // airport tarmac, then (below) spawn it once the map and model are in, and log.
           if (cmd == "drivetest") {
             const auto F = [](float f) { return std::bit_cast<uint32_t>(f); };
-            Call(ctx, base, sub_82C9C000, {ped, F(kDriveX), F(kDriveY + 20.0f), F(kDriveZ), 0, 0, 0});
+            g_drive_here = arg == "here";  // "drivetest here": at the player's spot (city traffic)
+            if (g_drive_here) {
+              uint32_t xyz[3];
+              CallVector(ctx, base, sub_82C9ADD8, {ped, 1}, xyz);
+              g_drive_pos[0] = std::bit_cast<float>(xyz[0]);
+              g_drive_pos[1] = std::bit_cast<float>(xyz[1]);
+              g_drive_pos[2] = std::bit_cast<float>(xyz[2]);
+              g_drive_pos[3] = std::bit_cast<float>(Call(ctx, base, sub_82C9AF18, {ped}));
+            } else {
+              g_drive_pos[0] = kDriveX, g_drive_pos[1] = kDriveY, g_drive_pos[2] = kDriveZ, g_drive_pos[3] = kDriveHeading;
+              Call(ctx, base, sub_82C9C000, {ped, F(kDriveX), F(kDriveY + 20.0f), F(kDriveZ), 0, 0, 0});
+            }
             Call(ctx, base, sub_82CF0CC0, {Joaat("BLISTA")});
             g_drivetest = 1;
             g_drivetest_at = now + std::chrono::seconds(8);
@@ -500,9 +513,9 @@ REX_HOOK_RAW(sub_82CE9CA8) {
     if (g_drivetest == 1 && now >= g_drivetest_at) {
       const auto F = [](float f) { return std::bit_cast<uint32_t>(f); };
       if (Call(ctx, base, sub_82CF0A90, {Joaat("BLISTA")}) & 0xFF) {
-        Call(ctx, base, sub_82CA4DB8, {F(kDriveX), F(kDriveY), F(kDriveZ), F(80.0f), 1, 0, 0, 0});
-        const uint32_t vehicle = Call(ctx, base, sub_82D5CBC8,
-                                      {Joaat("BLISTA"), F(kDriveX), F(kDriveY), F(kDriveZ), F(kDriveHeading), 1, 1});
+        if (!g_drive_here) Call(ctx, base, sub_82CA4DB8, {F(kDriveX), F(kDriveY), F(kDriveZ), F(80.0f), 1, 0, 0, 0});
+        const uint32_t vehicle = Call(ctx, base, sub_82D5CBC8, {Joaat("BLISTA"), F(g_drive_pos[0]), F(g_drive_pos[1]),
+                                                                F(g_drive_pos[2] + 0.5f), F(g_drive_pos[3]), 1, 1});
         if (vehicle) {
           Call(ctx, base, sub_82D4E168, {vehicle});
           Call(ctx, base, sub_82D0C3D8, {ped, vehicle, uint32_t(-1)});

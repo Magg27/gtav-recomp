@@ -112,6 +112,9 @@ REXCVAR_DEFINE_BOOL(gtav_native_exact_cache, false, "GTAV",
 #else
 #define GTAV_CONVERT_THREADS_DEFAULT 0
 #endif
+REXCVAR_DEFINE_BOOL(gtav_native_snapshot_cache, true, "GTAV",
+                    "Fence-copied vertex snapshots: convert each distinct snapshot once (keyed by its bytes) "
+                    "instead of every frame (driving: 3-7 MB a frame, streams 10-12 ms)");
 REXCVAR_DEFINE_INT32(gtav_native_convert_threads, GTAV_CONVERT_THREADS_DEFAULT, "GTAV",
                      "Worker threads that convert per-frame vertex data (fence snapshots, inline vertices) while "
                      "the frame is recorded (0: on the render thread; live, the pool keeps its first size)");
@@ -3980,6 +3983,25 @@ struct Backend::Impl {
     RectExpand(d, vl, rect_slot, views, cache ? &c : nullptr);
   }
 
+  struct SnapEntry {
+    std::unique_ptr<RenderBuffer> buffer;
+    uint64_t size = 0, used = 0;
+  };
+  std::unordered_map<uint64_t, SnapEntry> snap_cache;
+  uint64_t snap_hits = 0, snap_misses = 0, snap_bytes_total = 0;
+  // Snapshots not drawn for 3 frames are dropped; past 256 MB everything older than this frame.
+  void EvictSnapCache() {
+    const uint64_t keep = snap_bytes_total > (256ull << 20) ? 0 : 3;
+    for (auto it = snap_cache.begin(); it != snap_cache.end();) {
+      if (frame - it->second.used > keep) {
+        snap_bytes_total -= it->second.size;
+        dead_buffers.push_back(std::move(it->second.buffer));
+        it = snap_cache.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
   void EvictRectCache() {
     if (frame % 64) return;
     for (auto it = rect_cache.begin(); it != rect_cache.end();) {
@@ -4506,7 +4528,28 @@ struct Backend::Impl {
         slots[slot_count++] = RenderInputSlot(s, host_stride);
         continue;
       }
-      if (inline_data || snapped) {  // per-draw data: per-frame upload memory, never cached
+      if (snapped && !inline_data && !dumping && REXCVAR_GET(gtav_native_snapshot_cache)) {
+        // The snapshot's bytes are the key: the same vehicle/ped data frame after frame is
+        // converted once. Entries unused for a few frames are dropped (EvictSnapCache).
+        const uint64_t bytes = uint64_t(vertices) * stride, host = uint64_t(vertices) * host_stride;
+        const uint64_t skey = Hash(guest, bytes, key ^ (host << 20));
+        auto& e = snap_cache[skey];
+        if (!e.buffer || e.size != host) {
+          if (e.buffer) dead_buffers.push_back(std::move(e.buffer));
+          e.buffer = device->createBuffer(
+              RenderBufferDesc::UploadBuffer(std::max<uint64_t>(host, 16), RenderBufferFlag::VERTEX));
+          ConvertInto(static_cast<uint8_t*>(e.buffer->map()), host, convert);
+          e.size = host;
+          snap_bytes_total += host;
+          conv_bytes[2] += host;
+          conv_draws[2]++;
+          snap_misses++;
+        } else {
+          snap_hits++;
+        }
+        e.used = frame;
+        ref = RenderBufferReference(e.buffer.get());
+      } else if (inline_data || snapped) {  // per-draw data: per-frame upload memory, never cached
         conv_bytes[inline_data ? 1 : 2] += uint64_t(vertices) * host_stride;
         conv_draws[inline_data ? 1 : 2]++;
         auto a = upload.Allocate(uint64_t(vertices) * host_stride, 16);
@@ -5974,6 +6017,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.frame_generation++;
   s.EvictTextures();
   s.EvictRectCache();
+  s.EvictSnapCache();
   s.InvalidateDrawState();
   s.prof = {};
   s.prof.on = f.index % 8 == 0;
@@ -6092,6 +6136,9 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
                   "snapshots {:.0f} KB ({:.0f}), rebuilt buffers {:.0f} KB ({:.0f})",
                   s.conv_bytes[0] / n / 1024, s.conv_bytes[1] / n / 1024, s.conv_draws[1] / n, s.conv_bytes[2] / n / 1024,
                   s.conv_draws[2] / n, s.conv_bytes[3] / n / 1024, s.conv_draws[3] / n);
+      REXLOG_INFO("[native]   snapshots per frame: {:.1f} from the cache, {:.1f} converted ({} cached, {:.1f} MB)",
+                  s.snap_hits / n, s.snap_misses / n, s.snap_cache.size(), s.snap_bytes_total / 1048576.0);
+      s.snap_hits = s.snap_misses = 0;
       REXLOG_INFO("[native]   rect lists per frame: {:.1f} from the cache, {:.1f} expanded ({} sites cached)",
                   s.rect_hits / n, s.rect_misses / n, s.rect_cache.size());
       s.rect_hits = s.rect_misses = 0;
