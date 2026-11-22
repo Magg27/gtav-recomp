@@ -1736,6 +1736,126 @@ index a0a178d..9bf7599 100644
          context.Clear();
        }
      }
+diff --git a/src/codegen/builders/builder_context.h b/src/codegen/builders/builder_context.h
+index 33ac6d0..0157c42 100644
+--- a/src/codegen/builders/builder_context.h
++++ b/src/codegen/builders/builder_context.h
+@@ -113,6 +113,8 @@ struct BuilderContext {
+    * False when the function shares registers with an intra-function bl partner.
+    */
+   bool localizeNonVolatiles() const;
++  void syncNonVolatiles(bool to_ctx, const char* indent);
++  void restoreNonVolatiles(const char* indent);
+ 
+   /**
+    * @brief Get expression for general-purpose register access.
+diff --git a/src/codegen/builders/context.cpp b/src/codegen/builders/context.cpp
+index f78e0d8..c29716b 100644
+--- a/src/codegen/builders/context.cpp
++++ b/src/codegen/builders/context.cpp
+@@ -79,16 +79,48 @@ std::string BuilderContext::v(size_t index) {
+   return fmt::format("ctx.v{}", index);
+ }
+ 
++// A share_registers function (an SEH funclet, a fragment split off another function) keeps CR,
++// CTR and XER in ctx too: its "caller" may have set them before branching into it.
+ std::string BuilderContext::cr(size_t index) {
+-  if (config().crRegistersAsLocalVariables) {
++  if (config().crRegistersAsLocalVariables && !fn.sharesRegisters()) {
+     locals.cr[index] = true;
+     return fmt::format("cr{}", index);
+   }
+   return fmt::format("ctx.cr{}", index);
+ }
+ 
++// After a call into a share_registers function: put back the ctx non-volatiles saved before it
++// (nv_saved), which belong to this function's caller.
++void BuilderContext::restoreNonVolatiles(const char* indent) {
++  for (size_t i = 14; i < 32; ++i) println("{}ctx.r{} = nv_saved.r{};", indent, i, i);
++  for (size_t i = 14; i < 32; ++i) println("{}ctx.f{} = nv_saved.f{};", indent, i, i);
++}
++
++// Localized non-volatiles (r14-r31, f14-f31, v14-v31 / v64-v127) to ctx before a call into a
++// share_registers function (to_ctx) or back from it afterwards.
++void BuilderContext::syncNonVolatiles(bool to_ctx, const char* indent) {
++  auto one = [&](const char* k, size_t i) {
++    if (to_ctx) println("{}ctx.{}{} = {}{};", indent, k, i, k, i);
++    else println("{}{}{} = ctx.{}{};", indent, k, i, k, i);
++  };
++  // All of r14-r31 / f14-f31, not just the ones seen so far in this function's text: with
++  // backward branches a register can be set by code that runs before this point but is
++  // emitted after it (an unseen one becomes a zero-initialised local; these calls are rare).
++  for (size_t i = 14; i < 32; ++i) { locals.r[i] = true; one("r", i); }
++  for (size_t i = 14; i < 32; ++i) { locals.f[i] = true; one("f", i); }
++  for (size_t i = 14; i < 128; ++i) if (locals.v[i] && (i < 32 || i >= 64)) one("v", i);
++  // ... and the condition register fields, CTR and XER when those are locals here.
++  for (size_t i = 0; i < 8; ++i) if (locals.cr[i]) one("cr", i);
++  if (locals.ctr) {
++    if (to_ctx) println("{}ctx.ctr = ctr;", indent); else println("{}ctr = ctx.ctr;", indent);
++  }
++  if (locals.xer) {
++    if (to_ctx) println("{}ctx.xer = xer;", indent); else println("{}xer = ctx.xer;", indent);
++  }
++}
++
+ const char* BuilderContext::ctr() {
+-  if (config().ctrAsLocalVariable) {
++  if (config().ctrAsLocalVariable && !fn.sharesRegisters()) {
+     locals.ctr = true;
+     return "ctr";
+   }
+@@ -96,7 +128,7 @@ const char* BuilderContext::ctr() {
+ }
+ 
+ const char* BuilderContext::xer() {
+-  if (config().xerAsLocalVariable) {
++  if (config().xerAsLocalVariable && !fn.sharesRegisters()) {
+     locals.xer = true;
+     return "xer";
+   }
+@@ -213,16 +245,17 @@ void BuilderContext::emit_function_call(uint32_t address) {
+       // them back afterwards. Only registers already localized here can be live at
+       // this point, so that set is the whole live-in the funclet can see.
+       if (targetFn->sharesRegisters() && localizeNonVolatiles()) {
+-        for (size_t i = 14; i < 32; ++i) {
+-          if (locals.r[i])
+-            println("\tctx.r{} = r{};", i, i);
+-        }
++        // This function owns its non-volatiles as locals, so the ctx copies belong to whoever
++        // called it (possibly a ctx-based function relying on them being preserved): save them,
++        // hand ours over, take the results back, then restore the caller's.
++        println("\t{{");
++        println("\t\tconst PPCContext nv_saved = ctx;");
++        syncNonVolatiles(true, "\t\t");
+         emitCtx.reference(name);
+-        println("\t{}(ctx, base);", name);
+-        for (size_t i = 14; i < 32; ++i) {
+-          if (locals.r[i])
+-            println("\tr{} = ctx.r{};", i, i);
+-        }
++        println("\t\t{}(ctx, base);", name);
++        syncNonVolatiles(false, "\t\t");
++        restoreNonVolatiles("\t\t");
++        println("\t}}");
+         return;
+       }
+ 
+@@ -298,7 +331,15 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
+           auto* targetFn = callTarget->asFunction();
+           emitCtx.reference(targetFn->name());
+           println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
++          // A conditional tail call hands over the live non-volatiles like a call does
++          // (fragments split off a function read them: sub_83795654 crashed without it).
++          const bool share = targetFn->sharesRegisters() && localizeNonVolatiles();
++          if (share) {
++            println("\t\tconst PPCContext nv_saved = ctx;");
++            syncNonVolatiles(true, "\t\t");
++          }
+           println("\t\t{}(ctx, base);", targetFn->name());
++          if (share) restoreNonVolatiles("\t\t");
+           println("\t\treturn;");
+           println("\t}}");
+         } else if (callTarget->isImport()) {
 diff --git a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
 index b2d70f5..a101ca6 100644
 --- a/src/codegen/builders/system.cpp
@@ -4330,10 +4450,10 @@ index c24fbd1..0663781 100644
    return 1;
  }
 diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
-index 76cc877..c2990df 100644
+index 76cc877..f59613e 100644
 --- a/src/system/xmemory.cpp
 +++ b/src/system/xmemory.cpp
-@@ -13,12 +13,14 @@
+@@ -13,12 +13,18 @@
  #include <cstring>
  #include <utility>
  
@@ -4341,6 +4461,10 @@ index 76cc877..c2990df 100644
 +#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
  #include <sys/mman.h>
  #endif
++#if defined(__linux__)
++#include <dlfcn.h>
++#include <execinfo.h>
++#endif
  
  #include <fmt/format.h>
  
@@ -4349,7 +4473,7 @@ index 76cc877..c2990df 100644
  #include <rex/assert.h>
  #include <rex/chrono/clock.h>
  #include <rex/cvar.h>
-@@ -363,6 +365,27 @@ int Memory::MapViews(uint8_t* mapping_base) {
+@@ -363,6 +369,27 @@ int Memory::MapViews(uint8_t* mapping_base) {
    // 0xE0000000 4 KB offset is emulated via host_address_offset and on the CPU
    // side if system allocation granularity is bigger than 4 KB.
    uint64_t granularity_mask = ~uint64_t(system_allocation_granularity_ - 1);
@@ -4377,7 +4501,7 @@ index 76cc877..c2990df 100644
    for (size_t n = 0; n < rex::countof(map_info); n++) {
      views_.all_views[n] = reinterpret_cast<uint8_t*>(rex::memory::MapFileView(
          mapping_, mapping_base + map_info[n].virtual_address_start,
-@@ -547,6 +570,12 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+@@ -547,6 +574,24 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
          "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
          is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
          rex::thread::current_thread_id());
@@ -4387,6 +4511,18 @@ index 76cc877..c2990df 100644
 +      REXSYS_ERROR("  guest lr 0x{:08X} sp 0x{:08X} r3 0x{:08X} r31 0x{:08X}", uint32_t(ctx->lr), ctx->r1.u32,
 +                   ctx->r3.u32, ctx->r31.u32);
 +    }
++#if defined(__linux__)
++    // The host frames (module + offset, symbolize with addr2line/nm): which generated functions.
++    void* frames[32];
++    int n = backtrace(frames, 32);
++    for (int i = 0; i < n; ++i) {
++      Dl_info info{};
++      if (dladdr(frames[i], &info) && info.dli_fname)
++        REXSYS_ERROR("  host #{} {}+0x{:x} {}", i, info.dli_fname,
++                     reinterpret_cast<uintptr_t>(frames[i]) - reinterpret_cast<uintptr_t>(info.dli_fbase),
++                     info.dli_sname ? info.dli_sname : "");
++    }
++#endif
      return false;
    }
  
