@@ -4685,10 +4685,22 @@ index db830e4..f053f2a 100644
    bool success = semaphore_->Release(release_count, &previous_count);
    if (out_previous_count) {
 diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
-index 77bce25..71f2a4c 100644
+index 77bce25..6d780f0 100644
 --- a/src/system/xthread.cpp
 +++ b/src/system/xthread.cpp
-@@ -470,7 +470,9 @@ X_STATUS XThread::Create() {
+@@ -37,6 +37,11 @@
+ #include <rex/thread.h>
+ #include <rex/vec128.h>
+ 
++// Guest Sleep(0): 0 yields (desktop: GTA V's update thread calls it ~1,500 times a frame from a
++// backoff spin, and every microsecond slept there is frame time); N > 0 sleeps N microseconds
++// instead. S23 FE same-run A/B 11-22, 0 vs 50: 20.5/18.1 vs 19.4/17.8 fps: yield there too.
++REXCVAR_DEFINE_INT32(guest_sleep_zero_us, 0, "Kernel",
++                     "Guest Sleep(0): 0 = yield the core, N = sleep N microseconds (live)");
+ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
+                     "Ignores game-specified thread priorities");
+ 
+@@ -470,7 +475,9 @@ X_STATUS XThread::Create() {
      set_name(fmt::format("XThread{:04X}", thread_->system_id()));
    }
  
@@ -4699,7 +4711,7 @@ index 77bce25..71f2a4c 100644
      thread_->set_priority(creation_params_.creation_flags & 0x20 ? 1 : 0);
    }
  
-@@ -1025,7 +1027,11 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
+@@ -1025,8 +1032,14 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
      }
    } else {
      if (timeout_ms == 0) {
@@ -4710,8 +4722,11 @@ index 77bce25..71f2a4c 100644
 +      // every Sleep(0) became a 100 us nanosleep, ~1,500 times a frame on GTA V's update thread).
 +      if (priority_ < 0) {
          rex::thread::Sleep(std::chrono::microseconds(100));
++      } else if (const int32_t us = REXCVAR_GET(guest_sleep_zero_us); us > 0) {
++        rex::thread::Sleep(std::chrono::microseconds(us));
        } else {
          rex::thread::MaybeYield();
+       }
 diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
 index 5bd3dc5..adff0de 100644
 --- a/src/ui/CMakeLists.txt
