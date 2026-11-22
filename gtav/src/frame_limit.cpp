@@ -34,10 +34,10 @@ REXCVAR_DEFINE_BOOL(gtav_vehicle_30fps, true, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_timestep_nudge, false, "GTAV",
                     "Keep the frame timestep out of a narrow band around 1/60 s: there the vehicle handling "
                     "runs ~50% faster (#12). Off: the drive test showed the real 60 Hz pacing, not the timestep value, is the trigger");
-REXCVAR_DEFINE_INT32(gtav_vehicle_fps, 50, "GTAV",
+REXCVAR_DEFINE_INT32(gtav_vehicle_fps, 120, "GTAV",
                      "Frame rate in vehicles when gtav_vehicle_30fps is on: 30 = the game's own limiter (the Xbox). "
                      "Any rate the sleep limiter holds, away from ~60, drives like 30 (drive tests 11-21: 29-55 and "
-                     "65-120 fps match; ~60 and unlimited are faster), so the default is 50");
+                     "65-120 fps match; ~60 is ~50% faster, unlimited ~8%): 120 keeps the speed on foot");
 REXCVAR_DEFINE_BOOL(gtav_audio_unsync, true, "GTAV",
                     "Above 30 fps: stop the audio update waiting for the next 16 ms audio frame "
                     "(otherwise the game cannot exceed 62.5 fps)");
