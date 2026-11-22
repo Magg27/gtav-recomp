@@ -36,7 +36,9 @@ if [ "${RELEASE:-0}" = 1 ]; then
   NAME=gtav-recomp-release
   LIBS=("$ROOT/build/android-dll/libmain.so" "$ROOT/build/android-dll/libgtav_fast.so"
         "$ROOT/build/android-dll/libgtav_setup.so")
-  sed 's/ *android:debuggable="true"//' "$APP/AndroidManifest.xml" > "$OUT/AndroidManifest.release.xml"
+  # KEEP_DEBUGGABLE=1: a release-layout APK that run-as can enter (phone tests only, never shipped).
+  if [ "${KEEP_DEBUGGABLE:-0}" = 1 ]; then cp "$APP/AndroidManifest.xml" "$OUT/AndroidManifest.release.xml"
+  else sed 's/ *android:debuggable="true"//' "$APP/AndroidManifest.xml" > "$OUT/AndroidManifest.release.xml"; fi
   MANIFEST=$OUT/AndroidManifest.release.xml
 fi
 ASSETS=()

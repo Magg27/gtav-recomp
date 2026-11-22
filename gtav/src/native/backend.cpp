@@ -112,6 +112,10 @@ REXCVAR_DEFINE_BOOL(gtav_native_exact_cache, false, "GTAV",
 #else
 #define GTAV_CONVERT_THREADS_DEFAULT 0
 #endif
+REXCVAR_DEFINE_BOOL(gtav_native_slot_memo, true, "GTAV",
+                    "Native renderer: reuse texture-slot descriptors within a frame (slot and fetch-block memos)");
+REXCVAR_DEFINE_BOOL(gtav_native_const_reuse, true, "GTAV",
+                    "Native renderer: reuse the previous draw's shared constant block and skip unchanged push constants");
 REXCVAR_DEFINE_BOOL(gtav_native_snapshot_cache, true, "GTAV",
                     "Fence-copied vertex snapshots: convert each distinct snapshot once (keyed by its bytes) "
                     "instead of every frame (driving: 3-7 MB a frame, streams 10-12 ms)");
@@ -2992,7 +2996,13 @@ struct Backend::Impl {
     return b.buffer.get();
   }
 
-  uint32_t TextureDescriptor(RenderCommandList* list, const uint32_t words[6], uint32_t* dimension) {
+  // *resolved (optional): the resolved (render-target) texture behind the descriptor, which
+  // must be in SHADER_READ (and have its pending clears flushed) whenever a draw samples it; ~0
+  // cast (kUnmemoizable) when the descriptor is a per-call view that must not be reused.
+  static inline RenderTexture* const kUnmemoizable = reinterpret_cast<RenderTexture*>(~uintptr_t(0));
+  uint32_t TextureDescriptor(RenderCommandList* list, const uint32_t words[6], uint32_t* dimension,
+                             RenderTexture** resolved = nullptr) {
+    if (resolved) *resolved = nullptr;
     uint32_t base = FetchBaseAddress(words);
     *dimension = 0;
     if (!base) return kNull2D;
@@ -3003,6 +3013,7 @@ struct Backend::Impl {
       ResolvedTexture* r = LatestResolved(base & 0x1FFFFFFF, false);
       if (!r || !r->cube_descriptor) return kNullCube;
       Transition(list, r->texture.get(), RenderTextureLayout::SHADER_READ);
+      if (resolved) *resolved = r->texture.get();
       return r->cube_descriptor;
     }
     if (dim == 3) return kNullCube;  // (cube from guest memory: not yet)
@@ -3010,8 +3021,12 @@ struct Backend::Impl {
     if (ResolvedTexture* r = dim == 2 ? nullptr : LatestResolved(base & 0x1FFFFFFF, fetch_format == 22 || fetch_format == 23,
                                             (words[2] & 0x1FFF) + 1, ((words[2] >> 13) & 0x1FFF) + 1)) {
       if (dim == 1 && !(words[0] >> 31) && (r->fetch_words[0] >> 31))
-        if (uint32_t untiled = LinearViewOfTiled(list, base & 0x1FFFFFFF, *r, words)) return untiled;
+        if (uint32_t untiled = LinearViewOfTiled(list, base & 0x1FFFFFFF, *r, words)) {
+          if (resolved) *resolved = kUnmemoizable;
+          return untiled;
+        }
       Transition(list, r->texture.get(), RenderTextureLayout::SHADER_READ);
+      if (resolved) *resolved = r->texture.get();
       return r->descriptor;
     }
     uint64_t key = Hash(words, 24);
@@ -3817,6 +3832,9 @@ struct Backend::Impl {
     uint64_t hash = 0;
     uint32_t generation = 0;
     std::array<uint32_t, 192> sc{};
+    std::array<RenderTexture*, 32> tex{};  // per slot: resolved texture to Transition on a hit
+    uint32_t tex_mask = 0;                 // slots with one
+    bool memoizable = true;
     uint32_t key_size = 0;
     std::array<uint8_t, 4 + 768> key{};  // the slot mask, then the six words of each sampled slot
   };
@@ -3833,6 +3851,7 @@ struct Backend::Impl {
     uint32_t words[6];
     uint32_t dim, descriptor, sampler, generation;
     uint32_t filled = 0;  // resolve_count when filled
+    RenderTexture* tex = nullptr;  // resolved texture: Transition again on a hit (layout, pending clears)
   };
   static uint32_t ResolveBucket(uint32_t base) { return ((base & 0x1FFFFFFF) * 0x9E3779B1u) >> 22; }  // 1024
   std::array<uint32_t, 1024> resolve_seen{};
@@ -4273,15 +4292,27 @@ struct Backend::Impl {
     // matched, and descriptors for unsampled slots were never read.
     const uint32_t tex_mask =
         dumping ? ~0u : (d.vs_use ? d.vs_use->texture_mask : ~0u) | (d.ps_use ? d.ps_use->texture_mask : ~0u);
-    bool fetch_cached = !dumping && fetch_cache.valid && fetch_cache.offset == d.fetch && fetch_cache.mask == tex_mask &&
+    const bool no_memo = dumping || !REXCVAR_GET(gtav_native_slot_memo);
+    bool fetch_cached = !no_memo && fetch_cache.valid && fetch_cache.offset == d.fetch && fetch_cache.mask == tex_mask &&
                         fetch_cache.bm->hash == fetch_cache.hash && fetch_cache.bm->generation == slot_generation;
-    if (fetch_cached) std::memcpy(sc, fetch_cache.bm->sc.data(), sizeof(fetch_cache.bm->sc));
+    // A memo hit hands back descriptors without TextureDescriptor: the resolved (render-target)
+    // textures behind them still need SHADER_READ and their pending clears flushed, as a lookup
+    // would do (an attachment or copy since then changed the layout: Adreno sampled garbage, the
+    // 16x16 squares on the S23 FE).
+    auto rebind = [&](const BlockMemo& b) {
+      for (uint32_t m = b.tex_mask; m; m &= m - 1)
+        Transition(list, b.tex[std::countr_zero(m)], RenderTextureLayout::SHADER_READ);
+    };
+    if (fetch_cached) {
+      std::memcpy(sc, fetch_cache.bm->sc.data(), sizeof(fetch_cache.bm->sc));
+      rebind(*fetch_cache.bm);
+    }
     tprof.cached_blocks += fetch_cached;
     BlockMemo* bm = nullptr;      // the entry to fill (a block memo miss)
     BlockMemo* bm_hit = nullptr;  // the entry this draw's slots came from or went to
     uint8_t key[4 + 768];
     uint32_t key_size = 0;
-    if (!fetch_cached && !dumping) {
+    if (!fetch_cached && !no_memo) {
       std::memcpy(key, &tex_mask, 4);
       key_size = 4;
       for (uint32_t m = tex_mask; m; m &= m - 1) {
@@ -4293,6 +4324,7 @@ struct Backend::Impl {
       if (bm->generation == slot_generation && bm->hash == h && bm->key_size == key_size &&
           std::memcmp(bm->key.data(), key, key_size) == 0) {
         std::memcpy(sc, bm->sc.data(), sizeof(bm->sc));
+        rebind(*bm);
         block_memo_hits++;
         fetch_cached = true;
         bm_hit = bm;
@@ -4302,6 +4334,9 @@ struct Backend::Impl {
       }
     }
     auto slots_start = prof.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    uint32_t slot_tex_mask = 0;
+    bool block_memoizable = true;
+    std::array<RenderTexture*, 32> slot_tex;
     for (uint32_t slot = 0; slot < 32 && !fetch_cached; slot++) {
       sc[0 * 32 + slot] = kNull2D;
       sc[1 * 32 + slot] = kNull3D;
@@ -4323,14 +4358,28 @@ struct Backend::Impl {
       uint32_t mix = words[0] * 0x9E3779B1u;
       for (int w = 1; w < 6; w++) mix = (mix ^ words[w]) * 0x9E3779B1u;
       SlotMemo& memo = slot_memo[(mix >> 20) & (kSlotMemoSize - 1)];
-      if (!dumping && memo.generation == frame_generation && std::memcmp(memo.words, words, 24) == 0 &&
+      if (!no_memo && memo.generation == frame_generation && std::memcmp(memo.words, words, 24) == 0 &&
           resolve_seen[ResolveBucket(FetchBaseAddress(words))] <= memo.filled) {
         slot_memo_hits++;
         sc[memo.dim * 32 + slot] = memo.descriptor;
         sc[96 + slot] = memo.sampler;
+        if (memo.tex) {
+          Transition(list, memo.tex, RenderTextureLayout::SHADER_READ);
+          slot_tex[slot] = memo.tex;
+          slot_tex_mask |= 1u << slot;
+        }
         continue;
       }
-      descriptor = TextureDescriptor(list, words, &dim);
+      RenderTexture* resolved_tex = nullptr;
+      descriptor = TextureDescriptor(list, words, &dim, &resolved_tex);
+      const bool memoizable = resolved_tex != kUnmemoizable;
+      if (!memoizable) {
+        block_memoizable = false;
+        resolved_tex = nullptr;
+      } else if (resolved_tex) {
+        slot_tex[slot] = resolved_tex;
+        slot_tex_mask |= 1u << slot;
+      }
       if (dumping) {
         uint32_t base = FetchBaseAddress(words) & 0x1FFFFFFF;
         char kind = descriptor <= kNullCube ? 'N' : resolved_latest.count(base) ? 'R' : 'T';
@@ -4390,19 +4439,28 @@ struct Backend::Impl {
       }
       sc[dim * 32 + slot] = descriptor;
       sc[96 + slot] = SamplerDescriptor(words);
-      if (!dumping) {
+      if (!dumping && memoizable) {
         std::memcpy(memo.words, words, 24);
         memo.dim = dim;
         memo.descriptor = descriptor;
         memo.sampler = sc[96 + slot];
         memo.generation = frame_generation;
         memo.filled = resolve_count;
+        memo.tex = resolved_tex;
+      } else if (!dumping) {
+        memo.generation = 0;  // a per-call view: never reused
       }
     }
     if (!fetch_cached && prof.on)
       tprof.descriptor_ms +=
           8 * std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - slots_start).count();
+    if (bm && !block_memoizable) {
+      bm->generation = 0;
+      bm = nullptr;
+    }
     if (bm) {  // a block memo miss: remember this block's words
+      bm->tex = slot_tex;
+      bm->tex_mask = slot_tex_mask;
       std::memcpy(bm->sc.data(), sc, sizeof(bm->sc));
       std::memcpy(bm->key.data(), key, key_size);
       bm->key_size = key_size;
@@ -4804,7 +4862,8 @@ struct Backend::Impl {
       }
     }
     UploadAllocation shared;
-    if (last_shared.valid && std::memcmp(last_shared.cpu[last_shared.cur], shared_cpu, kSharedConstantsSize) == 0) {
+    if (REXCVAR_GET(gtav_native_const_reuse) && last_shared.valid &&
+        std::memcmp(last_shared.cpu[last_shared.cur], shared_cpu, kSharedConstantsSize) == 0) {
       shared = last_shared.gpu;
     } else {
       shared = upload.Allocate(kSharedConstantsSize);
@@ -4814,7 +4873,7 @@ struct Backend::Impl {
       last_shared.valid = true;
     }
     uint64_t push[3] = {vsc.gpu, psc.gpu, shared.gpu};
-    if (!ds.push_set || std::memcmp(ds.push, push, sizeof(push)) != 0) {
+    if (!REXCVAR_GET(gtav_native_const_reuse) || !ds.push_set || std::memcmp(ds.push, push, sizeof(push)) != 0) {
       list->setGraphicsPushConstants(0, push, 0, sizeof(push));
       std::memcpy(ds.push, push, sizeof(push));
       ds.push_set = true;
