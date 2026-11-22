@@ -89,10 +89,20 @@ index 1384fe9..3ff79fe 100644
 +
 +#endif  // TARGET_OS_IPHONE
 diff --git a/plume_render_interface.h b/plume_render_interface.h
-index 2048557..6df11cb 100644
+index 2048557..87aa892 100644
 --- a/plume_render_interface.h
 +++ b/plume_render_interface.h
-@@ -127,6 +127,8 @@ namespace plume {
+@@ -115,6 +115,9 @@ namespace plume {
+         virtual ~RenderCommandList() { }
+         virtual void begin() = 0;
+         virtual void end() = 0;
++        // Frees the recorded commands ahead of the next begin(), from any thread that owns the
++        // list then (its fence signalled): begin() skips its own reset. Default: begin() resets.
++        virtual void resetAhead() {}
+         virtual void barriers(RenderBarrierStages stages, const RenderBufferBarrier *bufferBarriers, uint32_t bufferBarriersCount, const RenderTextureBarrier *textureBarriers, uint32_t textureBarriersCount) = 0;
+         virtual void dispatch(uint32_t threadGroupCountX, uint32_t threadGroupCountY, uint32_t threadGroupCountZ) = 0;
+         virtual void traceRays(uint32_t width, uint32_t height, uint32_t depth, RenderBufferReference shaderBindingTable, const RenderShaderBindingGroupsInfo &shaderBindingGroupsInfo) = 0;
+@@ -127,6 +130,8 @@ namespace plume {
          virtual void setGraphicsPipelineLayout(const RenderPipelineLayout *pipelineLayout) = 0;
          virtual void setGraphicsPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset = 0, uint32_t size = 0) = 0;
          virtual void setGraphicsDescriptorSet(RenderDescriptorSet *descriptorSet, uint32_t setIndex) = 0;
@@ -101,7 +111,7 @@ index 2048557..6df11cb 100644
          virtual void setGraphicsRootDescriptor(RenderBufferReference bufferReference, uint32_t rootDescriptorIndex) = 0;
          virtual void setRaytracingPipelineLayout(const RenderPipelineLayout *pipelineLayout) = 0;
          virtual void setRaytracingPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset = 0, uint32_t size = 0) = 0;
-@@ -150,6 +152,13 @@ namespace plume {
+@@ -150,6 +155,13 @@ namespace plume {
          virtual void discardTexture(const RenderTexture* texture) = 0; // D3D12 only.
          virtual void resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) = 0;
          virtual void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) = 0;
@@ -115,7 +125,7 @@ index 2048557..6df11cb 100644
  
          // Concrete implementation shortcuts.
          inline void barriers(RenderBarrierStages stages, const RenderBufferBarrier &barrier) {
-@@ -241,6 +250,8 @@ namespace plume {
+@@ -241,6 +253,8 @@ namespace plume {
          virtual std::unique_ptr<RenderCommandSemaphore> createCommandSemaphore() = 0;
          virtual std::unique_ptr<RenderFramebuffer> createFramebuffer(const RenderFramebufferDesc &desc) = 0;
          virtual std::unique_ptr<RenderQueryPool> createQueryPool(uint32_t queryCount) = 0;
@@ -209,7 +219,7 @@ index ad63e0e..2ad1ad4 100644
          RenderFramebufferDesc() = default;
  
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 4fdc4bf..fe25401 100644
+index 4fdc4bf..910f4a8 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -11,7 +11,16 @@
@@ -580,16 +590,25 @@ index 4fdc4bf..fe25401 100644
          // Conversion sourced from Godot Engine's Vulkan Rendering Driver.
          auto mult64to128 = [](uint64_t u, uint64_t v, uint64_t &h, uint64_t &l) {
              uint64_t u1 = (u & 0xffffffff);
-@@ -2800,6 +2964,8 @@ namespace plume {
+@@ -2798,8 +2962,16 @@ namespace plume {
+         }
+     }
  
-     void VulkanCommandList::begin() {
+-    void VulkanCommandList::begin() {
++    void VulkanCommandList::resetAhead() {
          vkResetCommandBuffer(vk, 0);
++        resetDone = true;
++    }
++
++    void VulkanCommandList::begin() {
++        if (!resetDone) vkResetCommandBuffer(vk, 0);
++        resetDone = false;
 +        pendingClearMask = 0;
 +        shadingRate = 0;
  
          VkCommandBufferBeginInfo beginInfo = {};
          beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-@@ -2810,6 +2976,11 @@ namespace plume {
+@@ -2810,6 +2982,11 @@ namespace plume {
              fprintf(stderr, "vkBeginCommandBuffer failed with error code 0x%X.\n", res);
              return;
          }
@@ -601,7 +620,7 @@ index 4fdc4bf..fe25401 100644
      }
  
      void VulkanCommandList::end() {
-@@ -2888,7 +3059,18 @@ namespace plume {
+@@ -2888,7 +3065,18 @@ namespace plume {
              return;
          }
  
@@ -620,7 +639,7 @@ index 4fdc4bf..fe25401 100644
      }
  
      void VulkanCommandList::dispatch(uint32_t threadGroupCountX, uint32_t threadGroupCountY, uint32_t threadGroupCountZ) {
-@@ -3007,6 +3189,13 @@ namespace plume {
+@@ -3007,6 +3195,13 @@ namespace plume {
          setDescriptorSet(VK_PIPELINE_BIND_POINT_GRAPHICS, activeGraphicsPipelineLayout, descriptorSet, setIndex);
      }
  
@@ -634,7 +653,7 @@ index 4fdc4bf..fe25401 100644
      void VulkanCommandList::setGraphicsRootDescriptor(RenderBufferReference bufferReference, uint32_t rootDescriptorIndex) {
          assert(false && "Root descriptors are not supported in Vulkan.");
      }
-@@ -3104,6 +3293,7 @@ namespace plume {
+@@ -3104,6 +3299,7 @@ namespace plume {
  
      void VulkanCommandList::setFramebuffer(const RenderFramebuffer *framebuffer) {
          endActiveRenderPass();
@@ -642,7 +661,7 @@ index 4fdc4bf..fe25401 100644
  
          if (framebuffer != nullptr) {
              const VulkanFramebuffer *interfaceFramebuffer = static_cast<const VulkanFramebuffer *>(framebuffer);
-@@ -3150,6 +3340,16 @@ namespace plume {
+@@ -3150,6 +3346,16 @@ namespace plume {
          assert(attachmentIndex < targetFramebuffer->colorAttachments.size());
          assert((clearRectsCount == 0) || (clearRects != nullptr));
  
@@ -659,7 +678,7 @@ index 4fdc4bf..fe25401 100644
          checkActiveRenderPass();
  
          thread_local std::vector<VkClearRect> rectVector;
-@@ -3170,6 +3370,19 @@ namespace plume {
+@@ -3170,6 +3376,19 @@ namespace plume {
          assert(targetFramebuffer != nullptr);
          assert((clearRectsCount == 0) || (clearRects != nullptr));
  
@@ -679,7 +698,7 @@ index 4fdc4bf..fe25401 100644
          checkActiveRenderPass();
  
          thread_local std::vector<VkClearRect> rectVector;
-@@ -3486,6 +3699,8 @@ namespace plume {
+@@ -3486,6 +3705,8 @@ namespace plume {
      void VulkanCommandList::resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) {
          assert(queryPool != nullptr);
  
@@ -688,7 +707,7 @@ index 4fdc4bf..fe25401 100644
          const VulkanQueryPool *interfaceQueryPool = static_cast<const VulkanQueryPool *>(queryPool);
          vkCmdResetQueryPool(vk, interfaceQueryPool->vk, queryFirstIndex, queryCount);
      }
-@@ -3497,6 +3712,22 @@ namespace plume {
+@@ -3497,6 +3718,22 @@ namespace plume {
          vkCmdWriteTimestamp(vk, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, interfaceQueryPool->vk, queryIndex);
      }
  
@@ -711,7 +730,7 @@ index 4fdc4bf..fe25401 100644
      void VulkanCommandList::checkActiveRenderPass() {
          assert(targetFramebuffer != nullptr);
          
-@@ -3507,12 +3738,68 @@ namespace plume {
+@@ -3507,12 +3744,68 @@ namespace plume {
              beginInfo.framebuffer = targetFramebuffer->vk;
              beginInfo.renderArea.extent.width = targetFramebuffer->width;
              beginInfo.renderArea.extent.height = targetFramebuffer->height;
@@ -781,7 +800,7 @@ index 4fdc4bf..fe25401 100644
          if (activeRenderPass != VK_NULL_HANDLE) {
              vkCmdEndRenderPass(vk);
              activeRenderPass = VK_NULL_HANDLE;
-@@ -3666,7 +3953,22 @@ namespace plume {
+@@ -3666,7 +3959,22 @@ namespace plume {
          assert(fence != nullptr);
  
          VulkanCommandFence *interfaceFence = static_cast<VulkanCommandFence *>(fence);
@@ -805,7 +824,7 @@ index 4fdc4bf..fe25401 100644
          if (res != VK_SUCCESS) {
              fprintf(stderr, "vkWaitForFences failed with error code 0x%X.\n", res);
              return;
-@@ -3914,6 +4216,14 @@ namespace plume {
+@@ -3914,6 +4222,14 @@ namespace plume {
              featuresChain = &portabilityFeatures;
          }
  
@@ -820,7 +839,7 @@ index 4fdc4bf..fe25401 100644
          VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipelineFeatures = {};
          VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures = {};
          const bool rayTracingFound = (supportedOptionalExtensions.find(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) != supportedOptionalExtensions.end()) && (supportedOptionalExtensions.find(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) != supportedOptionalExtensions.end());
-@@ -3931,6 +4241,7 @@ namespace plume {
+@@ -3931,6 +4247,7 @@ namespace plume {
          deviceFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
          deviceFeatures.pNext = featuresChain;
          vkGetPhysicalDeviceFeatures2(physicalDevice, &deviceFeatures);
@@ -828,7 +847,7 @@ index 4fdc4bf..fe25401 100644
  
          // Check for properties.
          if (rayTracingFound) {
-@@ -4001,6 +4312,15 @@ namespace plume {
+@@ -4001,6 +4318,15 @@ namespace plume {
              createDeviceChain = &portabilityFeatures;
          }
  
@@ -844,7 +863,7 @@ index 4fdc4bf..fe25401 100644
          // Retrieve the information for the queue families.
          uint32_t queueFamilyCount = 0;
          vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, nullptr);
-@@ -4092,6 +4412,22 @@ namespace plume {
+@@ -4092,6 +4418,22 @@ namespace plume {
              }
          }
  
@@ -867,7 +886,7 @@ index 4fdc4bf..fe25401 100644
          VmaVulkanFunctions vmaFunctions = {};
          vmaFunctions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
          vmaFunctions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
-@@ -4120,6 +4456,11 @@ namespace plume {
+@@ -4120,6 +4462,11 @@ namespace plume {
          allocatorInfo.pVulkanFunctions = &vmaFunctions;
          allocatorInfo.instance = renderInterface->instance;
          allocatorInfo.vulkanApiVersion = renderInterface->appInfo.apiVersion;
@@ -879,7 +898,7 @@ index 4fdc4bf..fe25401 100644
  
          res = vmaCreateAllocator(&allocatorInfo, &allocator);
          if (res != VK_SUCCESS) {
-@@ -4203,12 +4544,22 @@ namespace plume {
+@@ -4203,12 +4550,22 @@ namespace plume {
          return std::make_unique<VulkanSampler>(this, desc);
      }
  
@@ -904,7 +923,7 @@ index 4fdc4bf..fe25401 100644
      }
  
      std::unique_ptr<RenderPipeline> VulkanDevice::createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) {
-@@ -4255,6 +4606,10 @@ namespace plume {
+@@ -4255,6 +4612,10 @@ namespace plume {
          return std::make_unique<VulkanQueryPool>(this, queryCount);
      }
  
@@ -915,7 +934,7 @@ index 4fdc4bf..fe25401 100644
      void VulkanDevice::setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) {
          assert(meshes != nullptr);
          assert(meshCount > 0);
-@@ -4463,6 +4818,11 @@ namespace plume {
+@@ -4463,6 +4824,11 @@ namespace plume {
      void VulkanDevice::release() {
          nullBuffer = nullptr; // force destruction before destroying allocator
  
@@ -927,7 +946,7 @@ index 4fdc4bf..fe25401 100644
          if (allocator != VK_NULL_HANDLE) {
              vmaDestroyAllocator(allocator);
              allocator = VK_NULL_HANDLE;
-@@ -4495,7 +4855,27 @@ namespace plume {
+@@ -4495,7 +4861,27 @@ namespace plume {
  #else
      VulkanInterface::VulkanInterface() {
  #endif
@@ -955,7 +974,7 @@ index 4fdc4bf..fe25401 100644
          if (res != VK_SUCCESS) {
              fprintf(stderr, "volkInitialize failed with error code 0x%X.\n", res);
              return;
-@@ -4666,6 +5046,26 @@ namespace plume {
+@@ -4666,6 +5052,26 @@ namespace plume {
          return instance != nullptr;
      }
  
@@ -983,7 +1002,7 @@ index 4fdc4bf..fe25401 100644
  
  #if defined(PLUME_SDL2_VULKAN_ENABLED)
 diff --git a/plume_vulkan.h b/plume_vulkan.h
-index 1d36b12..0de1495 100644
+index 1d36b12..968ff0e 100644
 --- a/plume_vulkan.h
 +++ b/plume_vulkan.h
 @@ -279,14 +279,25 @@ namespace plume {
@@ -1013,7 +1032,7 @@ index 1d36b12..0de1495 100644
          virtual ~VulkanQueryPool() override;
          virtual void queryResults() override;
          virtual const uint64_t *getResults() const override;
-@@ -302,6 +313,11 @@ namespace plume {
+@@ -302,11 +313,18 @@ namespace plume {
          const VulkanPipelineLayout *activeGraphicsPipelineLayout = nullptr;
          const VulkanPipelineLayout *activeRaytracingPipelineLayout = nullptr;
          VkRenderPass activeRenderPass = VK_NULL_HANDLE;
@@ -1025,7 +1044,14 @@ index 1d36b12..0de1495 100644
  
          VulkanCommandList(VulkanCommandQueue *queue);
          ~VulkanCommandList() override;
-@@ -319,6 +335,7 @@ namespace plume {
+         void begin() override;
+         void end() override;
++        void resetAhead() override;
++        bool resetDone = false;
+         void barriers(RenderBarrierStages stages, const RenderBufferBarrier *bufferBarriers, uint32_t bufferBarriersCount, const RenderTextureBarrier *textureBarriers, uint32_t textureBarriersCount) override;
+         void dispatch(uint32_t threadGroupCountX, uint32_t threadGroupCountY, uint32_t threadGroupCountZ) override;
+         void traceRays(uint32_t width, uint32_t height, uint32_t depth, RenderBufferReference shaderBindingTable, const RenderShaderBindingGroupsInfo &shaderBindingGroupsInfo) override;
+@@ -319,6 +337,7 @@ namespace plume {
          void setGraphicsPipelineLayout(const RenderPipelineLayout *pipelineLayout) override;
          void setGraphicsPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset = 0, uint32_t size = 0) override;
          void setGraphicsDescriptorSet(RenderDescriptorSet *descriptorSet, uint32_t setIndex) override;
@@ -1033,7 +1059,7 @@ index 1d36b12..0de1495 100644
          void setGraphicsRootDescriptor(RenderBufferReference bufferReference, uint32_t rootDescriptorIndex) override;
          void setRaytracingPipelineLayout(const RenderPipelineLayout *pipelineLayout) override;
          void setRaytracingPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset = 0, uint32_t size = 0) override;
-@@ -342,6 +359,8 @@ namespace plume {
+@@ -342,6 +361,8 @@ namespace plume {
          void discardTexture(const RenderTexture* texture) override;
          void resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) override;
          void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
@@ -1042,7 +1068,7 @@ index 1d36b12..0de1495 100644
          void checkActiveRenderPass();
          void endActiveRenderPass();
          void setDescriptorSet(VkPipelineBindPoint bindPoint, const VulkanPipelineLayout *pipelineLayout, const RenderDescriptorSet *descriptorSet, uint32_t setIndex);
-@@ -404,9 +423,11 @@ namespace plume {
+@@ -404,9 +425,11 @@ namespace plume {
  
      struct VulkanDevice : RenderDevice {
          VkDevice vk = VK_NULL_HANDLE;
@@ -1054,7 +1080,7 @@ index 1d36b12..0de1495 100644
          VmaAllocator allocator = VK_NULL_HANDLE;
          uint32_t queueFamilyIndices[3] = {};
          std::vector<VulkanQueueFamily> queueFamilies;
-@@ -416,6 +437,7 @@ namespace plume {
+@@ -416,6 +439,7 @@ namespace plume {
          VkPhysicalDeviceSampleLocationsPropertiesEXT sampleLocationProperties = {};
          std::unique_ptr<RenderBuffer> nullBuffer;
          bool loadStoreOpNoneSupported = false;
@@ -1062,7 +1088,7 @@ index 1d36b12..0de1495 100644
          bool nullDescriptorSupported = false;
  
          VulkanDevice(VulkanInterface *renderInterface, const std::string &preferredDeviceName);
-@@ -436,6 +458,7 @@ namespace plume {
+@@ -436,6 +460,7 @@ namespace plume {
          std::unique_ptr<RenderCommandSemaphore> createCommandSemaphore() override;
          std::unique_ptr<RenderFramebuffer> createFramebuffer(const RenderFramebufferDesc &desc) override;
          std::unique_ptr<RenderQueryPool> createQueryPool(uint32_t queryCount) override;
@@ -1070,7 +1096,7 @@ index 1d36b12..0de1495 100644
          void setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) override;
          void setTopLevelASBuildInfo(RenderTopLevelASBuildInfo &buildInfo, const RenderTopLevelASInstance *instances, uint32_t instanceCount, bool preferFastBuild, bool preferFastTrace) override;
          void setShaderBindingTableInfo(RenderShaderBindingTableInfo &tableInfo, const RenderShaderBindingGroups &groups, const RenderPipeline *pipeline, RenderDescriptorSet **descriptorSets, uint32_t descriptorSetCount) override;
-@@ -466,4 +489,9 @@ namespace plume {
+@@ -466,4 +491,9 @@ namespace plume {
          const std::vector<std::string> &getDeviceNames() const override;
          bool isValid() const;
      };

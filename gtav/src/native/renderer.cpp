@@ -846,8 +846,10 @@ class Renderer {
     swapchain_->resize();
     REXLOG_INFO("[native] init: swap chain {}x{}", swapchain_->getWidth(), swapchain_->getHeight());
     for (uint32_t i = 0; i < Backend::kFramesInFlight; i++) {
-      lists_[i] = queue_cmd_->createCommandList();
-      present_lists_[i] = queue_cmd_->createCommandList();
+      for (int k = 0; k < 2; k++) {
+        lists_[i][k] = queue_cmd_->createCommandList();
+        present_lists_[i][k] = queue_cmd_->createCommandList();
+      }
       fences_[i] = device_->createCommandFence();
       acquires_[i] = device_->createCommandSemaphore();
       gpu_times_[i] = device_->createQueryPool(2);
@@ -1284,8 +1286,24 @@ class Renderer {
     const uint32_t slot = slot_;
     auto wait_start = std::chrono::steady_clock::now();
     Retire(slot);
+    {
+      // The pair this slot's previous frame used is idle now (its fence passed): reset it in the
+      // background and record into the other pair.
+      const int used = pair_[slot], next = used ^ 1;
+      while (resetting_[slot][next].load(std::memory_order_acquire)) std::this_thread::yield();
+      resetting_[slot][used].store(1, std::memory_order_relaxed);
+      plume::RenderCommandList* a = lists_[slot][used].get();
+      plume::RenderCommandList* b = present_lists_[slot][used].get();
+      std::atomic<int>* flag = &resetting_[slot][used];
+      resetter_.Push([a, b, flag] {
+        a->resetAhead();
+        b->resetAhead();
+        flag->store(0, std::memory_order_release);
+      });
+      pair_[slot] = next;
+    }
     auto wait_end = std::chrono::steady_clock::now();
-    list_ = lists_[slot].get();
+    list_ = lists_[slot][pair_[slot]].get();
     list_->begin();
     plume::g_exactBarrierStages = REXCVAR_GET(gtav_native_exact_barriers);
     plume::g_clearLoadOps = REXCVAR_GET(gtav_native_load_clears);
@@ -1406,7 +1424,7 @@ class Renderer {
     }
     auto main_submit_end = std::chrono::steady_clock::now();
     uint32_t image = 0;
-    list_ = present_lists_[slot].get();
+    list_ = present_lists_[slot][pair_[slot]].get();
     list_->begin();
     bool acquired;
     {
@@ -1860,9 +1878,41 @@ class Renderer {
   std::unique_ptr<plume::RenderDevice> device_;
   std::unique_ptr<plume::RenderCommandQueue> queue_cmd_;
   std::unique_ptr<plume::RenderSwapChain> swapchain_;
-  std::unique_ptr<plume::RenderCommandList> lists_[Backend::kFramesInFlight];
+  // Two list pairs per slot, used in turn: when a slot's fence has passed, the pair its frame used
+  // is reset on resetter_ while the new frame records into the other pair (reset there last
+  // time). vkResetCommandBuffer of a whole frame was ~4% of the render thread on the S23 FE.
+  std::unique_ptr<plume::RenderCommandList> lists_[Backend::kFramesInFlight][2];
   std::unique_ptr<DeferredCommandList> deferred_;  // --gtav_native_record_thread
-  std::unique_ptr<plume::RenderCommandList> present_lists_[Backend::kFramesInFlight];  // window copy
+  std::unique_ptr<plume::RenderCommandList> present_lists_[Backend::kFramesInFlight][2];  // window copy
+  int pair_[Backend::kFramesInFlight] = {};
+  std::atomic<int> resetting_[Backend::kFramesInFlight][2] = {};
+  struct Resetter {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<std::function<void()>> jobs;
+    bool started = false;
+    void Push(std::function<void()> job) {
+      std::lock_guard lock(mutex);
+      if (!started) {
+        started = true;
+        std::thread([this] {
+          NameThread("gtav-reset");
+          for (;;) {
+            std::function<void()> j;
+            {
+              std::unique_lock lock(mutex);
+              cv.wait(lock, [this] { return !jobs.empty(); });
+              j = std::move(jobs.front());
+              jobs.pop_front();
+            }
+            j();
+          }
+        }).detach();
+      }
+      jobs.push_back(std::move(job));
+      cv.notify_one();
+    }
+  } resetter_;
   std::unique_ptr<plume::RenderCommandFence> fences_[Backend::kFramesInFlight];
   std::unique_ptr<plume::RenderQueryPool> gpu_times_[Backend::kFramesInFlight];  // main list start / end
   bool gpu_timed_[Backend::kFramesInFlight] = {};
