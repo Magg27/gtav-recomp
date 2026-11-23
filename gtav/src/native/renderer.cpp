@@ -73,7 +73,11 @@ REXCVAR_DEFINE_INT32(gtav_native_record_worker_cores, 0, "GTAV",
                      "thread; 1: the little cores (leaves the big ones to the game's threads); 2: not pinned");
 REXCVAR_DEFINE_INT32(gtav_native_record_pad_ms, 0, "GTAV",
                      "Test: the render thread sleeps this long inside every frame's recording (does the frame "
-                     "time follow the recording time? A/B it against 0)");  // backend.cpp
+                     "time follow the recording time? A/B it against 0)"); REXCVAR_DEFINE_BOOL(gtav_native_early_fence, false, "GTAV",
+                    "Test: tell the capture a frame's guest memory has been read as soon as the frame is "
+                    "recorded, before its copy into the window is prepared (the guest GPU thread waits for "
+                    "that at fences with --gtav_native_fence_wait)");
+ // backend.cpp
 REXCVAR_DEFINE_BOOL(gtav_native_load_clears, GTAV_LOAD_CLEARS_DEFAULT, "GTAV",
                     "Native renderer: a whole-target clear at the start of a render pass becomes its load op (tile "
                     "GPUs skip loading the old contents)");
@@ -1451,6 +1455,13 @@ class Renderer {
     if (deferred) timing_.replay_wait_sum += deferred_->Finish();
     if (const int32_t pad = REXCVAR_GET(gtav_native_record_pad_ms); pad > 0)
       std::this_thread::sleep_for(std::chrono::milliseconds(pad));
+    // --gtav_native_early_fence: nothing below reads the frame's guest memory, except a dump
+    // (WriteDump decodes guest textures), the flicker inspector and a replay capture.
+    if (REXCVAR_GET(gtav_native_early_fence) && !(backend_ok_ && backend_.Dumping()) &&
+        !REXCVAR_GET(gtav_native_flicker_catch) && !REXCVAR_GET(gtav_native_replay) && !key_replay_.load()) {
+      FenceCopiesRecorded(frame.index);
+      fence_released_ = frame.index + 1;
+    }
     // The frame's rendering goes to the GPU now, in a command buffer of its own; only the copy
     // into the window waits for a drawable. As one submission, the whole frame waited for the
     // swap chain image (MoltenVK: ~4 ms of GPU idle per frame on the M1).
@@ -1785,7 +1796,7 @@ class Renderer {
       AbStep(presented);
       Present(frame);
       AbRecord(presented);
-      FenceCopiesRecorded(frame.index);
+      if (fence_released_ != frame.index + 1) FenceCopiesRecorded(frame.index);
       render_state_ = 2;
       {
         std::lock_guard lock(recorded_mutex_);
@@ -1843,6 +1854,7 @@ class Renderer {
   std::chrono::steady_clock::time_point ab_last_;
   uint64_t ab_frames_ = 0;
   double last_record_ms_ = 0, last_record_cpu_ms_ = 0, last_idle_ms_ = 0;
+  uint64_t fence_released_ = 0;  // frame index + 1 of the frame Present already released (early fence)
   void AbStep(uint64_t presented) {
     std::string spec = REXCVAR_GET(gtav_native_ab);
     if (spec != ab_spec_) {
