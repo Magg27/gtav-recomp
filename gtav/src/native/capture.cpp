@@ -638,7 +638,14 @@ void ApplyFenceCopies(FramePacket& f) {
   }
 }
 
-void DrawsRecorded(uint32_t count) { g_recorded_draws.store(count, std::memory_order_release); }
+// Only ever forward within a frame (ApplyFenceCopies starts it at 0): with record workers the
+// count comes from several threads, each for the stretch of the frame it recorded.
+void DrawsRecorded(uint32_t count) {
+  uint32_t seen = g_recorded_draws.load(std::memory_order_relaxed);
+  while (seen < count && !g_recorded_draws.compare_exchange_weak(seen, count, std::memory_order_release,
+                                                                 std::memory_order_relaxed)) {
+  }
+}
 
 void FenceCopiesRecorded(uint64_t frame) {
   {

@@ -5,7 +5,9 @@
 
 #include <rex/logging.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <type_traits>
@@ -59,9 +61,12 @@ constexpr uint64_t kWakeBatch = 48;
 constexpr uint32_t Align8(uint32_t n) { return (n + 7) & ~7u; }
 
 // Payload layouts.
+// Followed by the buffer barriers, the texture barriers and, resolved (see barriers()), the state
+// each resource was in before: stages per buffer, layout per texture, stages per texture.
 struct BarriersRec {
   RenderBarrierStages stages;
   uint32_t buffers, textures;
+  uint32_t resolved;
 };
 struct DrawRec {
   uint32_t a, b, c;
@@ -105,15 +110,19 @@ struct CopyRegionRec {
   RenderBufferReference dst, src;
   uint64_t size;
 };
+// dst_layout / src_layout (texture copies and resolves): the layouts plume kept for the textures
+// when the call was made (RenderCommandList::trackedLayout), for overrideNextCopyLayouts.
 struct CopyTextureRegionRec {
   RenderTextureCopyLocation dst, src;
   uint32_t x, y, z;
   bool box;
   RenderBox src_box;
+  RenderTextureLayout dst_layout, src_layout;
 };
 struct PairRec {
   const void* dst;
   const void* src;
+  RenderTextureLayout dst_layout, src_layout;
 };
 struct ResolveRegionRec {
   const RenderTexture* dst;
@@ -122,6 +131,7 @@ struct ResolveRegionRec {
   bool rect;
   RenderRect src_rect;
   RenderResolveMode mode;
+  RenderTextureLayout dst_layout, src_layout;
 };
 struct QueryRec {
   const RenderQueryPool* pool;
@@ -132,66 +142,118 @@ struct QueryRec {
 DeferredCommandList::DeferredCommandList(std::function<void()> on_start) : on_start_(std::move(on_start)) {}
 
 DeferredCommandList::~DeferredCommandList() {
-  if (thread_.joinable()) {
-    {
-      std::lock_guard lock(mutex_);
-      stop_ = true;
-    }
+  {
+    std::lock_guard lock(mutex_);
+    stop_ = true;
+  }
+  work_cv_.notify_all();
+  for (auto& t : threads_) t.join();
+}
+
+void DeferredCommandList::Begin(RenderCommandList* target, uint32_t workers,
+                                std::function<RenderCommandList*()> next_list) {
+  std::lock_guard lock(mutex_);  // the workers are idle: every chunk of the last frame was replayed
+  target_ = target;
+  next_list_ = std::move(next_list);
+  active_workers_ = std::clamp(workers, 1u, kMaxWorkers);
+  while (threads_.size() < active_workers_)
+    threads_.emplace_back([this, worker = uint32_t(threads_.size())] { Run(worker); });
+  if (blocks_.empty()) blocks_.push_back(std::make_unique<uint8_t[]>(kBlockSize));
+  write_block_ = write_offset_ = 0;
+  chunk_count_ = next_take_ = done_count_ = 0;
+  since_wake_ = 0;
+  lists_.clear();
+  finished_ = false;
+  OpenChunk(target);
+}
+
+void DeferredCommandList::OpenChunk(RenderCommandList* list) {
+  Chunk& c = chunks_[chunk_count_];
+  c.list = list;
+  c.start = blocks_[write_block_].get() + write_offset_;
+  c.published.store(0, std::memory_order_relaxed);
+  c.closed.store(false, std::memory_order_relaxed);
+  open_ = &c;
+  open_records_ = 0;
+  lists_.push_back(list);
+  chunk_count_++;
+}
+
+void DeferredCommandList::Cut() {
+  RenderCommandList* list = next_list_();
+  open_->closed.store(true, std::memory_order_release);
+  {
+    std::lock_guard lock(mutex_);
+    OpenChunk(list);
+  }
+  // The reader of the closed chunk may sleep for more of it, and an idle worker can take the new one.
+  if (sleepers_.load(std::memory_order_seq_cst)) {
+    std::lock_guard lock(mutex_);
     work_cv_.notify_all();
-    thread_.join();
   }
 }
 
-void DeferredCommandList::Begin(RenderCommandList* target) {
-  if (!thread_.joinable()) thread_ = std::thread([this] { Run(); });
-  std::lock_guard lock(mutex_);  // the replay thread is idle: everything published was replayed
-  target_ = target;
-  write_block_ = write_offset_ = 0;
-  read_block_ = read_offset_ = 0;
+DeferredCommandList::Chunk* DeferredCommandList::Take(uint32_t worker) {
+  if (next_take_ == chunk_count_ || (worker != kHelper && worker >= active_workers_)) return nullptr;
+  return &chunks_[next_take_++];
 }
 
 double DeferredCommandList::Finish() {
+  if (finished_) return 0.0;
   auto start = std::chrono::steady_clock::now();
-  if (replayed_.load(std::memory_order_acquire) != appended_) {
-    waiting_.store(true, std::memory_order_seq_cst);
-    Wake();
+  open_->closed.store(true, std::memory_order_release);
+  finished_ = true;
+  for (;;) {  // what no worker has started (all of a small frame: no thread is woken for it)
+    Chunk* c;
+    {
+      std::lock_guard lock(mutex_);
+      c = Take(kHelper);
+    }
+    if (!c) break;
+    ReplayChunk(*c, kHelper);
+  }
+  {
     std::unique_lock lock(mutex_);
-    while (replayed_.load(std::memory_order_acquire) != appended_)
-      done_cv_.wait_for(lock, std::chrono::milliseconds(1));
-    waiting_.store(false, std::memory_order_relaxed);
+    if (done_count_ != chunk_count_) work_cv_.notify_all();  // (a reader sleeping for more of its chunk)
+    while (done_count_ != chunk_count_) done_cv_.wait_for(lock, std::chrono::milliseconds(1));
   }
   return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
-double DeferredCommandList::TakeBusyMs() { return busy_ms_.exchange(0); }
+double DeferredCommandList::TakeBusyMs() { return double(busy_ns_.exchange(0)) * 1e-6; }
 
 uint8_t* DeferredCommandList::Append(Op op, uint32_t payload) {
+  // A block ends with a NextBlock record: a header and the address of the next block.
+  constexpr uint32_t kNext = uint32_t(sizeof(Header) + sizeof(uint8_t*));
   const uint32_t size = Align8(uint32_t(sizeof(Header)) + payload);
-  if (size + sizeof(Header) > kBlockSize) {
+  if (size + kNext > kBlockSize) {
     REXLOG_ERROR("[native] deferred command of {} bytes", size);
     std::abort();
   }
-  Block* block = &blocks_[write_block_];
-  if (!block->data) block->data = std::make_unique<uint8_t[]>(kBlockSize);
-  // Always room left for the NextBlock record.
-  if (write_offset_ + size + sizeof(Header) > kBlockSize) {
-    const bool wrap = write_block_ + 1 == kBlocks;
-    const uint32_t next = wrap ? 0 : write_block_ + 1;
-    if (!blocks_[next].data) blocks_[next].data = std::make_unique<uint8_t[]>(kBlockSize);
-    auto* h = reinterpret_cast<Header*>(block->data.get() + write_offset_);
-    h->op = Op::NextBlock;
-    h->size = sizeof(Header);
-    write_offset_ += sizeof(Header);
-    Publish();
-    // Wrapping onto block 0: wait until it is all replayed (the NextBlock record included).
-    if (wrap) Finish();
-    write_block_ = next;
+  if (write_offset_ + size + kNext > kBlockSize) {
+    if (write_block_ + 1 == blocks_.size()) {
+      if (blocks_.size() == kMaxBlocks) {
+        REXLOG_ERROR("[native] deferred commands of one frame past {} MB", kMaxBlocks * (kBlockSize >> 20));
+        std::abort();
+      }
+      blocks_.push_back(std::make_unique<uint8_t[]>(kBlockSize));
+    }
+    if (!finished_) {
+      auto* h = reinterpret_cast<Header*>(blocks_[write_block_].get() + write_offset_);
+      h->op = Op::NextBlock;
+      h->size = kNext;
+      const uint8_t* next = blocks_[write_block_ + 1].get();
+      std::memcpy(h + 1, &next, sizeof(next));
+      open_->published.store(++open_records_, std::memory_order_release);
+    }
+    write_block_++;
     write_offset_ = 0;
-    block = &blocks_[write_block_];
   }
-  auto* h = reinterpret_cast<Header*>(block->data.get() + write_offset_);
+  auto* h = reinterpret_cast<Header*>(blocks_[write_block_].get() + write_offset_);
   h->op = op;
   h->size = size;
+  last_ = h;
+  last_offset_ = write_offset_;
   write_offset_ += size;
   return reinterpret_cast<uint8_t*>(h + 1);
 }
@@ -203,74 +265,96 @@ void* DeferredCommandList::AppendUser(uint32_t kind, uint32_t size) {
 }
 
 void DeferredCommandList::Publish() {
-  appended_++;
-  published_.store(appended_, std::memory_order_seq_cst);
-  if (appended_ - last_wake_ >= kWakeBatch && sleeping_.load(std::memory_order_seq_cst) &&
-      appended_ - replayed_.load(std::memory_order_relaxed) >= kWakeBatch) {
-    last_wake_ = appended_;
-    Wake();
+  if (finished_) {
+    // After Finish: every list is complete up to here and no worker is in one.
+    Replay(last_, lists_.back(), kHelper);
+    write_offset_ = last_offset_;
+    return;
+  }
+  open_->published.store(++open_records_, std::memory_order_release);
+  if (++since_wake_ >= kWakeBatch) {
+    since_wake_ = 0;
+    if (sleepers_.load(std::memory_order_seq_cst)) {
+      std::lock_guard lock(mutex_);
+      work_cv_.notify_all();
+    }
   }
 }
 
-void DeferredCommandList::Wake() {
-  std::lock_guard lock(mutex_);
-  work_cv_.notify_one();
+void DeferredCommandList::Run(uint32_t worker) {
+  char name[16];
+  std::snprintf(name, sizeof(name), "gtav-rec%u", worker + 1);
+  NameThread(name);
+  uint32_t config = config_.load(std::memory_order_relaxed);
+  if (on_start_) on_start_();
+  for (;;) {
+    Chunk* c;
+    {
+      std::unique_lock lock(mutex_);
+      for (;;) {
+        if (stop_) return;
+        if ((c = Take(worker))) break;
+        // Until the producer has a batch of records or a new chunk (it notifies under the mutex
+        // when sleepers_ is set, and a chunk opens under the mutex: no wake is missed).
+        sleepers_.fetch_add(1, std::memory_order_seq_cst);
+        work_cv_.wait(lock);
+        sleepers_.fetch_sub(1, std::memory_order_seq_cst);
+      }
+    }
+    if (const uint32_t now = config_.load(std::memory_order_relaxed); now != config) {
+      config = now;
+      if (on_start_) on_start_();
+    }
+    ReplayChunk(*c, worker);
+  }
 }
 
-void DeferredCommandList::Run() {
-  NameThread("gtav-deferred");
-  if (on_start_) on_start_();
+void DeferredCommandList::ReplayChunk(Chunk& chunk, uint32_t worker) {
+  const uint8_t* at = chunk.start;
   uint64_t done = 0;
   for (;;) {
-    uint64_t available = published_.load(std::memory_order_acquire);
+    // `closed` first: once it is set, `published` is final.
+    const bool closed = chunk.closed.load(std::memory_order_acquire);
+    uint64_t available = chunk.published.load(std::memory_order_acquire);
     if (available == done) {
+      if (closed) break;
       for (int i = 0; i < 64 && available == done; i++) {
         std::this_thread::yield();
-        available = published_.load(std::memory_order_acquire);
+        available = chunk.published.load(std::memory_order_acquire);
       }
       if (available == done) {
+        // Sleep until the producer has a batch (it wakes sleepers every kWakeBatch records, and at
+        // a cut and in Finish) or the timeout.
         std::unique_lock lock(mutex_);
-        sleeping_.store(true, std::memory_order_seq_cst);
-        // Wait for a batch (or for Finish) unless one is already there.
-        while (!stop_) {
-          available = published_.load(std::memory_order_seq_cst);
-          if (available - done >= kWakeBatch || (available != done && waiting_.load(std::memory_order_seq_cst)))
-            break;
+        sleepers_.fetch_add(1, std::memory_order_seq_cst);
+        if (chunk.published.load(std::memory_order_seq_cst) == done && !chunk.closed.load(std::memory_order_seq_cst))
           work_cv_.wait_for(lock, std::chrono::milliseconds(2));
-          available = published_.load(std::memory_order_seq_cst);
-          if (available != done) break;  // woken, or the timeout with something pending
-        }
-        sleeping_.store(false, std::memory_order_relaxed);
-        if (stop_) return;
+        sleepers_.fetch_sub(1, std::memory_order_seq_cst);
+        continue;
       }
     }
     auto start = std::chrono::steady_clock::now();
     while (done < available) {
-      const Block& block = blocks_[read_block_];
-      auto* h = reinterpret_cast<const Header*>(block.data.get() + read_offset_);
+      auto* h = reinterpret_cast<const Header*>(at);
       if (h->op == Op::NextBlock) {
-        read_block_ = (read_block_ + 1) % kBlocks;
-        read_offset_ = 0;
+        std::memcpy(&at, h + 1, sizeof(at));
       } else {
-        Replay(h);
-        read_offset_ += h->size;
+        Replay(h, chunk.list, worker);
+        at += h->size;
       }
       done++;
     }
-    busy_ms_.store(busy_ms_.load(std::memory_order_relaxed) +
-                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
-                   std::memory_order_relaxed);
-    replayed_.store(done, std::memory_order_release);
-    if (waiting_.load(std::memory_order_seq_cst)) {
-      std::lock_guard lock(mutex_);
-      done_cv_.notify_all();
-    }
+    busy_ns_.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - start).count()),
+                       std::memory_order_relaxed);
   }
+  std::lock_guard lock(mutex_);
+  done_count_++;
+  done_cv_.notify_all();
 }
 
-void DeferredCommandList::Replay(const Header* h) {
+void DeferredCommandList::Replay(const Header* h, RenderCommandList* t, uint32_t worker) {
   const uint8_t* p = reinterpret_cast<const uint8_t*>(h + 1);
-  RenderCommandList* t = target_;
   auto rec = [&](auto* type) -> decltype(auto) {
     using T = std::remove_pointer_t<decltype(type)>;
     return *reinterpret_cast<const T*>(p);
@@ -287,7 +371,18 @@ void DeferredCommandList::Replay(const Header* h) {
       auto* buffers = reinterpret_cast<const RenderBufferBarrier*>(after((BarriersRec*)nullptr));
       auto* textures = reinterpret_cast<const RenderTextureBarrier*>(
           reinterpret_cast<const uint8_t*>(buffers) + Align8(Bytes<RenderBufferBarrier>(r.buffers)));
-      t->barriers(r.stages, r.buffers ? buffers : nullptr, r.buffers, r.textures ? textures : nullptr, r.textures);
+      if (!r.resolved) {
+        t->barriers(r.stages, r.buffers ? buffers : nullptr, r.buffers, r.textures ? textures : nullptr, r.textures);
+        break;
+      }
+      auto* buffer_stages = reinterpret_cast<const RenderBarrierStages*>(
+          reinterpret_cast<const uint8_t*>(textures) + Align8(Bytes<RenderTextureBarrier>(r.textures)));
+      auto* texture_layouts = reinterpret_cast<const RenderTextureLayout*>(
+          reinterpret_cast<const uint8_t*>(buffer_stages) + Align8(Bytes<RenderBarrierStages>(r.buffers)));
+      auto* texture_stages = reinterpret_cast<const RenderBarrierStages*>(
+          reinterpret_cast<const uint8_t*>(texture_layouts) + Align8(Bytes<RenderTextureLayout>(r.textures)));
+      t->barriersResolved(r.stages, r.buffers ? buffers : nullptr, r.buffers, buffer_stages,
+                          r.textures ? textures : nullptr, r.textures, texture_layouts, texture_stages);
       break;
     }
     case Op::Dispatch: {
@@ -395,6 +490,7 @@ void DeferredCommandList::Replay(const Header* h) {
     }
     case Op::CopyTextureRegion: {
       const auto& r = rec((CopyTextureRegionRec*)nullptr);
+      t->overrideNextCopyLayouts(r.dst_layout, r.src_layout);
       t->copyTextureRegion(r.dst, r.src, r.x, r.y, r.z, r.box ? &r.src_box : nullptr);
       break;
     }
@@ -405,16 +501,19 @@ void DeferredCommandList::Replay(const Header* h) {
     }
     case Op::CopyTexture: {
       const auto& r = rec((PairRec*)nullptr);
+      t->overrideNextCopyLayouts(r.dst_layout, r.src_layout);
       t->copyTexture(static_cast<const RenderTexture*>(r.dst), static_cast<const RenderTexture*>(r.src));
       break;
     }
     case Op::ResolveTexture: {
       const auto& r = rec((PairRec*)nullptr);
+      t->overrideNextCopyLayouts(r.dst_layout, r.src_layout);
       t->resolveTexture(static_cast<const RenderTexture*>(r.dst), static_cast<const RenderTexture*>(r.src));
       break;
     }
     case Op::ResolveTextureRegion: {
       const auto& r = rec((ResolveRegionRec*)nullptr);
+      t->overrideNextCopyLayouts(r.dst_layout, r.src_layout);
       t->resolveTextureRegion(r.dst, r.x, r.y, r.src, r.rect ? &r.src_rect : nullptr, r.mode);
       break;
     }
@@ -447,7 +546,7 @@ void DeferredCommandList::Replay(const Header* h) {
       break;
     }
     case Op::User:
-      user_fn_(user_context_, t, h->pad, p);
+      user_fn_(user_context_, t, worker, h->pad, p);
       break;
   }
 }
@@ -470,11 +569,23 @@ void PutArray(uint8_t*& p, const T* v, uint32_t n) {
 void DeferredCommandList::barriers(RenderBarrierStages stages, const RenderBufferBarrier* bufferBarriers,
                                    uint32_t bufferBarriersCount, const RenderTextureBarrier* textureBarriers,
                                    uint32_t textureBarriersCount) {
-  uint8_t* p = Append(Op::Barriers, Align8(sizeof(BarriersRec)) + Align8(Bytes<RenderBufferBarrier>(bufferBarriersCount)) +
-                                        Align8(Bytes<RenderTextureBarrier>(textureBarriersCount)));
-  Put(p, BarriersRec{stages, bufferBarriersCount, textureBarriersCount});
-  PutArray(p, bufferBarriers, bufferBarriersCount);
-  PutArray(p, textureBarriers, textureBarriersCount);
+  const uint32_t nb = bufferBarriersCount, nt = textureBarriersCount;
+  uint8_t* p = Append(Op::Barriers, Align8(sizeof(BarriersRec)) + Align8(Bytes<RenderBufferBarrier>(nb)) +
+                                        Align8(Bytes<RenderTextureBarrier>(nt)) + Align8(Bytes<RenderBarrierStages>(nb)) +
+                                        Align8(Bytes<RenderTextureLayout>(nt)) + Align8(Bytes<RenderBarrierStages>(nt)));
+  auto* rec = reinterpret_cast<BarriersRec*>(p);
+  Put(p, BarriersRec{stages, nb, nt, 0});
+  PutArray(p, bufferBarriers, nb);
+  PutArray(p, textureBarriers, nt);
+  auto* buffer_stages = reinterpret_cast<RenderBarrierStages*>(p);
+  auto* texture_layouts = reinterpret_cast<RenderTextureLayout*>(p + Align8(Bytes<RenderBarrierStages>(nb)));
+  auto* texture_stages = reinterpret_cast<RenderBarrierStages*>(reinterpret_cast<uint8_t*>(texture_layouts) +
+                                                                Align8(Bytes<RenderTextureLayout>(nt)));
+  // The state plume keeps per resource moves on here, in the order of the frame; the barrier itself
+  // is recorded from the copy of the old state whenever (and on whichever list) the record plays.
+  rec->resolved = target_->resolveBarriers(stages, bufferBarriers, nb, textureBarriers, nt, buffer_stages,
+                                           texture_layouts, texture_stages);
+  if (!rec->resolved) in_order_only_ = true;
   Publish();
 }
 
@@ -635,28 +746,37 @@ void DeferredCommandList::copyTextureRegion(const RenderTextureCopyLocation& dst
                                             const RenderTextureCopyLocation& srcLocation, uint32_t dstX, uint32_t dstY,
                                             uint32_t dstZ, const RenderBox* srcBox) {
   uint8_t* p = Append(Op::CopyTextureRegion, sizeof(CopyTextureRegionRec));
-  CopyTextureRegionRec r{dstLocation, srcLocation, dstX, dstY, dstZ, srcBox != nullptr, {}};
+  CopyTextureRegionRec r{dstLocation, srcLocation, dstX, dstY, dstZ, srcBox != nullptr, {},
+                         Tracked(dstLocation.texture), Tracked(srcLocation.texture)};
   if (srcBox) r.src_box = *srcBox;
   Put(p, r);
   Publish();
 }
 
-#define GTAV_DEFERRED_PAIR(method, op, type)                  \
-  void DeferredCommandList::method(type dst, type src) {      \
-    uint8_t* p = Append(Op::op, sizeof(PairRec));             \
-    Put(p, PairRec{dst, src});                                \
-    Publish();                                                \
-  }
-GTAV_DEFERRED_PAIR(copyBuffer, CopyBuffer, const RenderBuffer*)
-GTAV_DEFERRED_PAIR(copyTexture, CopyTexture, const RenderTexture*)
-GTAV_DEFERRED_PAIR(resolveTexture, ResolveTexture, const RenderTexture*)
-#undef GTAV_DEFERRED_PAIR
+void DeferredCommandList::copyBuffer(const RenderBuffer* dst, const RenderBuffer* src) {
+  uint8_t* p = Append(Op::CopyBuffer, sizeof(PairRec));
+  Put(p, PairRec{dst, src, RenderTextureLayout::UNKNOWN, RenderTextureLayout::UNKNOWN});
+  Publish();
+}
+
+void DeferredCommandList::copyTexture(const RenderTexture* dst, const RenderTexture* src) {
+  uint8_t* p = Append(Op::CopyTexture, sizeof(PairRec));
+  Put(p, PairRec{dst, src, Tracked(dst), Tracked(src)});
+  Publish();
+}
+
+void DeferredCommandList::resolveTexture(const RenderTexture* dst, const RenderTexture* src) {
+  uint8_t* p = Append(Op::ResolveTexture, sizeof(PairRec));
+  Put(p, PairRec{dst, src, Tracked(dst), Tracked(src)});
+  Publish();
+}
 
 void DeferredCommandList::resolveTextureRegion(const RenderTexture* dstTexture, uint32_t dstX, uint32_t dstY,
                                                const RenderTexture* srcTexture, const RenderRect* srcRect,
                                                RenderResolveMode resolveMode) {
   uint8_t* p = Append(Op::ResolveTextureRegion, sizeof(ResolveRegionRec));
-  ResolveRegionRec r{dstTexture, dstX, dstY, srcTexture, srcRect != nullptr, {}, resolveMode};
+  ResolveRegionRec r{dstTexture, dstX, dstY, srcTexture, srcRect != nullptr, {}, resolveMode, Tracked(dstTexture),
+                     Tracked(srcTexture)};
   if (srcRect) r.src_rect = *srcRect;
   Put(p, r);
   Publish();

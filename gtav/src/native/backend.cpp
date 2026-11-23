@@ -125,6 +125,13 @@ REXCVAR_DEFINE_INT32(gtav_native_record_workers, 0, "GTAV",
                      "Native renderer: threads that finish the frame's draws (constants, vertex data, binds, the "
                      "Vulkan calls) behind the render thread, which only prepares them (targets, textures, "
                      "pipelines). 0: the render thread does both. Live");
+REXCVAR_DEFINE_INT32(gtav_native_record_chunk_draws, 96, "GTAV",
+                     "Native renderer, with record workers: the frame's stream is cut where a render pass begins "
+                     "once a chunk holds this many draws; the chunks are recorded at the same time into command "
+                     "lists of their own (0: one chunk, recorded in order)");
+REXCVAR_DEFINE_INT32(gtav_native_record_chaos, 0, "GTAV",
+                     "Test, with record workers: cut at random pass boundaries and make the workers pause at "
+                     "random draws (shakes out what depends on the order the chunks are recorded in)");
 REXCVAR_DEFINE_BOOL(gtav_native_snapshot_cache, true, "GTAV",
                     "Fence-copied vertex snapshots: convert each distinct snapshot once (keyed by its bytes) "
                     "instead of every frame (driving: 3-7 MB a frame, streams 10-12 ms)");
@@ -3267,6 +3274,7 @@ struct Backend::Impl {
       RenderFramebufferDesc desc(attachments, count, depth ? depth->texture.get() : nullptr);
       fb = device->createFramebuffer(desc);
     }
+    MaybeCutStream();  // a new command list from here, when the frame is recorded in chunks
     list->setFramebuffer(fb.get());
     if (pass_times)
       PassStamp(list, fmt::format("targets {}x{} {}c fmt {}{}{}", count ? color[0]->width : depth ? depth->width : 0,
@@ -3949,6 +3957,7 @@ struct Backend::Impl {
       if (stream) {
         std::memcpy(stream->AppendUser(kUserDraw, sizeof(rec)), &rec, sizeof(rec));
         stream->PublishUser();
+        chunk_draws++;
       } else {
         DrawBack(list, main_ctx, f, rec);
       }
@@ -5076,6 +5085,7 @@ struct Backend::Impl {
 
   // State of one thread turning DrawRecords into commands.
   struct RecordContext {
+    uint32_t chunk = 0;  // of the stream, being recorded
     DrawState draw_state;
     LastConstants last_vs, last_ps;
     LastShared last_shared;
@@ -5158,29 +5168,87 @@ struct Backend::Impl {
   };
 
   // Stream mode (--gtav_native_record_workers): `list` is a DeferredCommandList, and DrawFront's
-  // records go into it between the plume calls. Its replay thread turns them into draws with
-  // stream_ctx, in order, while the render thread prepares the following ones. Everything that
+  // records go into it between the plume calls. Its workers turn them into draws, each with a
+  // context of its own, while the render thread prepares the following ones. Everything that
   // depends on the draws' bound state (draw_state) is a record too.
+  //
+  // The stream is cut into chunks where a render pass begins (BindTargets); a chunk is recorded
+  // into a command list of its own, by one worker, at the same time as other chunks. A command
+  // list starts with nothing bound, so a chunk starts with a full draw-state reset.
   DeferredCommandList* stream = nullptr;  // during Execute, when the frame is recorded this way
-  RecordContext stream_ctx;
+  std::array<std::unique_ptr<RecordContext>, DeferredCommandList::kMaxWorkers + 1> worker_ctx;
   const FramePacket* stream_frame = nullptr;
   double stream_wait_ms = 0;
-  uint32_t stream_frames = 0;
-  enum : uint32_t { kUserDraw, kUserDrawSets, kUserReset };
-  static void StreamReplay(void* self, RenderCommandList* target, uint32_t kind, const void* payload) {
+  uint32_t stream_frames = 0, stream_chunks = 0;
+  uint32_t chunk_draws = 0;  // draw records since the last cut
+  uint32_t chunk_min = 0;    // cut from this many on (0: never)
+  uint32_t chunk_chaos = 0;
+  uint32_t cur_draw = 0;     // the draws before this one are in the stream (or were skipped)
+  // The game may write over the vertex data of a draw once DrawsRecorded has passed it
+  // (capture.cpp FenceReached), so that count moves through the chunks in order: `mark_chunk` is
+  // the first chunk still being recorded, and only its draws (and its end) move the count.
+  struct ChunkMark {
+    std::atomic<uint32_t> progress{0};  // draws up to here are recorded (index + 1 of the last one)
+    std::atomic<uint32_t> done{0};
+    uint32_t first_draw = 0;  // the draws before the chunk
+  };
+  std::array<ChunkMark, DeferredCommandList::kMaxChunks + 1> marks;
+  std::atomic<uint32_t> mark_chunk{0};
+  std::mutex mark_mutex;
+  enum : uint32_t { kUserDraw, kUserDrawSets, kUserReset, kUserChunkBegin, kUserChunkEnd };
+  static void StreamReplay(void* self, RenderCommandList* target, uint32_t worker, uint32_t kind,
+                           const void* payload) {
     Impl& s = *static_cast<Impl*>(self);
-    RecordContext& rc = s.stream_ctx;
+    RecordContext& rc = *s.worker_ctx[worker];
     switch (kind) {
       case kUserDraw: {
         const DrawRecord& rec = *static_cast<const DrawRecord*>(payload);
         s.DrawBack(target, rc, *s.stream_frame, rec);
-        DrawsRecorded(rec.index + 1);  // its guest data has been read
+        // Its guest data has been read. (seq_cst on both sides, here and in ChunkDone: one of the
+        // two sees the other's store, so the count is never left behind.)
+        s.marks[rc.chunk].progress.store(rec.index + 1, std::memory_order_seq_cst);
+        if (s.mark_chunk.load(std::memory_order_seq_cst) == rc.chunk) DrawsRecorded(rec.index + 1);
+        if (s.chunk_chaos && (rec.index * 2654435761u >> 26) == 0)
+          std::this_thread::sleep_for(std::chrono::microseconds(50 + (rec.index * 40503u & 255)));
         break;
       }
       case kUserDrawSets: s.BindDrawSets(target, rc.draw_state); break;
       case kUserReset: ApplyDrawStateReset(rc.draw_state, *static_cast<const uint32_t*>(payload)); break;
+      case kUserChunkBegin:
+        rc.chunk = *static_cast<const uint32_t*>(payload);
+        rc.draw_state = DrawState{};
+        break;
+      case kUserChunkEnd: s.ChunkDone(*static_cast<const uint32_t*>(payload)); break;
     }
   }
+  void ChunkDone(uint32_t chunk) {
+    std::lock_guard lock(mark_mutex);
+    marks[chunk].done.store(1, std::memory_order_relaxed);
+    uint32_t first = mark_chunk.load(std::memory_order_relaxed);
+    if (first != chunk) return;  // an earlier chunk is still being recorded
+    while (first < DeferredCommandList::kMaxChunks && marks[first].done.load(std::memory_order_relaxed)) first++;
+    mark_chunk.store(first, std::memory_order_seq_cst);
+    // (first_draw of the chunk after the last one of the frame: every draw.)
+    DrawsRecorded(std::max(marks[first].first_draw, marks[first].progress.load(std::memory_order_seq_cst)));
+  }
+  void StreamUser(uint32_t kind, uint32_t value) {
+    *static_cast<uint32_t*>(stream->AppendUser(kind, sizeof(uint32_t))) = value;
+    stream->PublishUser();
+  }
+  // Called where a render pass is about to begin (before setFramebuffer).
+  void MaybeCutStream() {
+    if (!stream || !chunk_min || active_query >= 0) return;  // (a query ends in the list it began in)
+    uint32_t need = chunk_min;
+    if (chunk_chaos) need = (chaos_state = chaos_state * 1664525u + 1013904223u) >> 28;  // 0..15
+    if (chunk_draws < need || !stream->CanCut()) return;
+    const uint32_t chunk = stream->ChunkIndex();
+    marks[chunk + 1].first_draw = cur_draw;  // before the end of `chunk` can be played
+    StreamUser(kUserChunkEnd, chunk);
+    stream->Cut();
+    StreamUser(kUserChunkBegin, chunk + 1);
+    chunk_draws = 0;
+  }
+  uint32_t chaos_state = 12345;
   void EnsureDrawSetsImpl(RenderCommandList* list) {
     if (stream) {
       stream->AppendUser(kUserDrawSets, 0);
@@ -7315,7 +7383,20 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   if (s.stream) {
     s.stream->SetUser(&Impl::StreamReplay, &s);
     s.stream_frame = &f;
-    s.stream_ctx.BeginFrame(s.prof.on);
+    for (auto& c : s.worker_ctx) {  // (the workers are idle between frames)
+      if (!c) c = std::make_unique<Impl::RecordContext>();
+      c->BeginFrame(s.prof.on);
+    }
+    for (auto& m : s.marks) {
+      m.progress.store(0, std::memory_order_relaxed);
+      m.done.store(0, std::memory_order_relaxed);
+      m.first_draw = 0;
+    }
+    s.mark_chunk.store(0, std::memory_order_seq_cst);
+    s.chunk_chaos = uint32_t(std::max(0, REXCVAR_GET(gtav_native_record_chaos)));
+    s.chunk_min = uint32_t(std::max(0, REXCVAR_GET(gtav_native_record_chunk_draws)));
+    s.chunk_draws = s.cur_draw = 0;
+    s.StreamUser(Impl::kUserChunkBegin, 0);
   }
   s.seqdiag = s.pass_stats && f.index && (f.index % 3000 == 0 || REXCVAR_GET(gtav_native_seqdiag));
   if (s.msaa_draws_frames) s.msaa_draws_frames--;
@@ -7362,7 +7443,9 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
         if (next_draw <= ci) next_draw = ci + 1;
         while (next_draw < f.commands.size() && f.commands[next_draw].kind != CommandKind::kDraw) next_draw++;
         if (next_draw < f.commands.size()) prefetch_draw(f.draws[f.commands[next_draw].index]);
+        s.cur_draw = c.index;
         s.Draw(list, f, f.draws[c.index]);
+        s.cur_draw = c.index + 1;
         s.pass_draws++;
         if (!s.stream) DrawsRecorded(c.index + 1);  // (stream mode: when its record is played)
         if (s.seqdiag) {
@@ -7387,10 +7470,14 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
     REXLOG_INFO("[native] PASSDIAG sequence of frame {}:\n{}", f.index, seq);
   }
   if (s.stream) {  // the draws are all in the stream: wait for them, then the rest of the frame as usual
+    const uint32_t chunk = s.stream->ChunkIndex();
+    s.marks[chunk + 1].first_draw = uint32_t(f.draws.size());
+    s.StreamUser(Impl::kUserChunkEnd, chunk);
     s.stream_wait_ms += s.stream->Finish();
     s.stream_frames++;
+    s.stream_chunks += chunk + 1;
     DrawsRecorded(uint32_t(f.draws.size()));
-    s.MergeContext(s.stream_ctx);
+    for (auto& c : s.worker_ctx) s.MergeContext(*c);
     s.stream = nullptr;
   }
   s.MergeContext(s.main_ctx);
@@ -7417,10 +7504,12 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
                   a.setup / n, a.consts / n, a.fetch / n, a.streams / n, a.pipe / n, a.submit / n, s.stat_draws);
       if (s.back_ms_sum > 0)
         REXLOG_INFO("[native]   split draws: {:.2f} ms of that in the second half (DrawBack); {} of {:.0f} frames had "
-                    "a record worker for it, the render thread waited {:.2f} ms per frame at the end",
-                    s.back_ms_sum / n, s.stream_frames, n, s.stream_frames ? s.stream_wait_ms / s.stream_frames : 0.0);
+                    "record workers for it ({:.1f} chunks a frame), the render thread recorded what was left "
+                    "and waited {:.2f} ms per frame at the end",
+                    s.back_ms_sum / n, s.stream_frames, n, s.stream_frames ? double(s.stream_chunks) / s.stream_frames : 0.0,
+                    s.stream_frames ? s.stream_wait_ms / s.stream_frames : 0.0);
       s.back_ms_sum = s.stream_wait_ms = 0;
-      s.stream_frames = 0;
+      s.stream_frames = s.stream_chunks = 0;
       REXLOG_INFO("[native]   vertices converted per frame: rect lists {:.0f} KB, inline {:.0f} KB ({:.0f} draws), "
                   "snapshots {:.0f} KB ({:.0f}), rebuilt buffers {:.0f} KB ({:.0f})",
                   s.conv_bytes[0] / n / 1024, s.conv_bytes[1] / n / 1024, s.conv_draws[1] / n, s.conv_bytes[2] / n / 1024,

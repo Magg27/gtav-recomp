@@ -67,7 +67,13 @@ REXCVAR_DEFINE_BOOL(gtav_native_exact_barriers, true, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_record_thread, false, "GTAV",
                     "Native renderer: a second thread turns the frame's commands into the Vulkan command buffer "
                     "while the render thread prepares the next draws (deferred_list.h)");
-REXCVAR_DECLARE(int32_t, gtav_native_record_workers);  // backend.cpp
+REXCVAR_DECLARE(int32_t, gtav_native_record_workers);
+REXCVAR_DEFINE_INT32(gtav_native_record_worker_cores, 0, "GTAV",
+                     "Android, with record workers: the cores they run on. 0: the big cores, with the render "
+                     "thread; 1: the little cores (leaves the big ones to the game's threads); 2: not pinned");
+REXCVAR_DEFINE_INT32(gtav_native_record_pad_ms, 0, "GTAV",
+                     "Test: the render thread sleeps this long inside every frame's recording (does the frame "
+                     "time follow the recording time? A/B it against 0)");  // backend.cpp
 REXCVAR_DEFINE_BOOL(gtav_native_load_clears, GTAV_LOAD_CLEARS_DEFAULT, "GTAV",
                     "Native renderer: a whole-target clear at the start of a render pass becomes its load op (tile "
                     "GPUs skip loading the old contents)");
@@ -118,8 +124,20 @@ static void PinToBigCores() {
   for (int i = n / 2; i < n - 1; i++) CPU_SET(i, &set);
   sched_setaffinity(0, sizeof(set), &set);
 }
+// The record workers (--gtav_native_record_worker_cores): 0 with the render thread on the big
+// cores, 1 on the little ones (the lower half of the CPU numbers), 2 wherever the scheduler puts them.
+static void PinToCores(int where) {
+  int n = int(sysconf(_SC_NPROCESSORS_CONF));
+  if (n < 4) return;
+  if (where == 0) return PinToBigCores();
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  for (int i = 0; i < (where == 1 ? n / 2 : n); i++) CPU_SET(i, &set);
+  sched_setaffinity(0, sizeof(set), &set);
+}
 #else
 static void PinToBigCores() {}
+static void PinToCores(int) {}
 #endif
 
 namespace gtav::native {
@@ -1295,10 +1313,14 @@ class Renderer {
       resetting_[slot][used].store(1, std::memory_order_relaxed);
       plume::RenderCommandList* a = lists_[slot][used].get();
       plume::RenderCommandList* b = present_lists_[slot][used].get();
+      std::vector<plume::RenderCommandList*> chunks;  // (record workers: the lists of the frame's other chunks)
+      for (uint32_t i = 0; i < chunk_used_[slot][used]; i++) chunks.push_back(chunk_lists_[slot][used][i].get());
+      chunk_used_[slot][used] = 0;
       std::atomic<int>* flag = &resetting_[slot][used];
-      resetter_.Push([a, b, flag] {
+      resetter_.Push([a, b, flag, chunks = std::move(chunks)] {
         a->resetAhead();
         b->resetAhead();
+        for (plume::RenderCommandList* l : chunks) l->resetAhead();
         flag->store(0, std::memory_order_release);
       });
       pair_[slot] = next;
@@ -1399,13 +1421,27 @@ class Renderer {
     // and the swap chain path).
     static const bool no_backend = std::getenv("GTAV_NATIVE_NO_BACKEND") != nullptr;
     plume::RenderCommandList* record_list = list_;
-    // --gtav_native_record_thread: the second thread only makes the Vulkan calls;
-    // --gtav_native_record_workers: it also finishes the draws (Backend::Execute's `stream`).
-    const bool workers = REXCVAR_GET(gtav_native_record_workers) > 0;
+    // --gtav_native_record_thread: a second thread only makes the Vulkan calls;
+    // --gtav_native_record_workers: that many threads also finish the draws (Backend::Execute's
+    // `stream`), each chunk of the frame into a command list of its own.
+    const int32_t worker_count = REXCVAR_GET(gtav_native_record_workers);
+    const bool workers = worker_count > 0;
     const bool deferred = workers || REXCVAR_GET(gtav_native_record_thread);
     if (deferred) {
-      if (!deferred_) deferred_ = std::make_unique<DeferredCommandList>([] { PinToBigCores(); });
-      deferred_->Begin(list_);
+      if (!deferred_)
+        deferred_ = std::make_unique<DeferredCommandList>([] { PinToCores(REXCVAR_GET(gtav_native_record_worker_cores)); });
+      if (const int32_t cores = REXCVAR_GET(gtav_native_record_worker_cores); cores != worker_cores_) {
+        worker_cores_ = cores;
+        deferred_->Reconfigure();
+      }
+      deferred_->Begin(list_, uint32_t(std::max(worker_count, 1)), [this, slot]() -> plume::RenderCommandList* {
+        auto& lists = chunk_lists_[slot][pair_[slot]];
+        uint32_t& used = chunk_used_[slot][pair_[slot]];
+        if (used == lists.size()) lists.push_back(queue_cmd_->createCommandList());
+        plume::RenderCommandList* l = lists[used++].get();
+        l->begin();
+        return l;
+      });
       record_list = deferred_.get();
     }
     plume::RenderTexture* front = backend_ok_ && !no_backend
@@ -1413,21 +1449,29 @@ class Renderer {
                                                          workers ? deferred_.get() : nullptr)
                                       : nullptr;
     if (deferred) timing_.replay_wait_sum += deferred_->Finish();
+    if (const int32_t pad = REXCVAR_GET(gtav_native_record_pad_ms); pad > 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(pad));
     // The frame's rendering goes to the GPU now, in a command buffer of its own; only the copy
     // into the window waits for a drawable. As one submission, the whole frame waited for the
     // swap chain image (MoltenVK: ~4 ms of GPU idle per frame on the M1).
     auto record_end = std::chrono::steady_clock::now();
     const double record_cpu_end = ThreadCpuMs();
-    if (gpu_timed_[slot]) list_->writeTimestamp(gpu_times_[slot].get(), 1);
     {
+      // The frame's lists in order: the main one, then (record workers) one per later chunk.
+      std::vector<plume::RenderCommandList*> lists;
+      if (deferred) lists = deferred_->Lists();
+      else lists.push_back(list_);
+      if (gpu_timed_[slot]) lists.back()->writeTimestamp(gpu_times_[slot].get(), 1);
       // Ended on the submit thread: vkEndCommandBuffer finalizes the whole frame's commands (~5%
-      // of the render thread on the S23 FE's Adreno driver), and nothing records into this list
-      // again before its fence (the present list goes after it on the same thread).
-      plume::RenderCommandList* main = list_;
-      submitter_.Push([this, main] {
-        main->end();
-        const plume::RenderCommandList* lists = main;
-        queue_cmd_->executeCommandLists(&lists, 1, nullptr, 0, nullptr, 0, nullptr);
+      // of the render thread on the S23 FE's Adreno driver), and nothing records into these lists
+      // again before their fence (the present list goes after them on the same thread).
+      submitter_.Push([this, lists = std::move(lists)] {
+        std::vector<const plume::RenderCommandList*> submit;
+        for (plume::RenderCommandList* l : lists) {
+          l->end();
+          submit.push_back(l);
+        }
+        queue_cmd_->executeCommandLists(submit.data(), uint32_t(submit.size()), nullptr, 0, nullptr, 0, nullptr);
       });
     }
     auto main_submit_end = std::chrono::steady_clock::now();
@@ -1728,7 +1772,8 @@ class Renderer {
         auto idle_start = std::chrono::steady_clock::now();
         render_state_ = 0;  // waiting for a frame
         cv_.wait(lock, [this] { return !queue_.empty(); });
-        timing_.idle_sum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - idle_start).count();
+        last_idle_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - idle_start).count();
+        timing_.idle_sum += last_idle_ms_;
         frame = std::move(queue_.front());
         queue_.pop_front();
       }
@@ -1780,8 +1825,9 @@ class Renderer {
   // logs per-setting averages every 1200 frames (both settings see the same scenes; the first 8
   // frames after a flip are not counted).
   struct AbStats {
-    double interval = 0, record = 0, record_cpu = 0, gpu = 0;
+    double interval = 0, record = 0, record_cpu = 0, gpu = 0, idle = 0;
     uint32_t n = 0, gpu_n = 0;
+    std::vector<float> intervals;  // per frame, for the median and the 90th percentile
     // What was recorded, per side: a change that should draw the same picture keeps these equal.
     uint64_t draws = 0, skipped = 0, passes = 0, barriers = 0;
   };
@@ -1792,7 +1838,7 @@ class Renderer {
   std::string ab_spec_, ab_name_, ab_values_[2];
   std::chrono::steady_clock::time_point ab_last_;
   uint64_t ab_frames_ = 0;
-  double last_record_ms_ = 0, last_record_cpu_ms_ = 0;
+  double last_record_ms_ = 0, last_record_cpu_ms_ = 0, last_idle_ms_ = 0;
   void AbStep(uint64_t presented) {
     std::string spec = REXCVAR_GET(gtav_native_ab);
     if (spec != ab_spec_) {
@@ -1822,7 +1868,10 @@ class Renderer {
     auto now = std::chrono::steady_clock::now();
     if (ab_phase_ >= 0) {
       auto& a = ab_[ab_phase_];
-      a.interval += std::chrono::duration<double, std::milli>(now - ab_last_).count();
+      const double interval = std::chrono::duration<double, std::milli>(now - ab_last_).count();
+      a.interval += interval;
+      a.intervals.push_back(float(interval));
+      a.idle += last_idle_ms_;
       a.record += last_record_ms_;
       a.record_cpu += last_record_cpu_ms_;
       a.n++;
@@ -1834,13 +1883,17 @@ class Renderer {
     }
     ab_last_ = now;
     if (!ab_name_.empty() && ab_frames_ % 1200 == 0 && ab_[0].n && ab_[1].n) {
-      auto line = [](const AbStats& a) {
+      auto line = [](AbStats& a) {
         // "cpu": the render thread's own CPU time while recording (wall time on a loaded machine
-        // is mostly waiting for a core).
-        return fmt::format("{:.1f} fps (frame {:.2f} ms, record {:.2f}, cpu {:.2f}, GPU {:.2f}; per frame {:.1f} draws, "
-                           "{:.2f} skipped, {:.2f} passes, {:.2f} barriers)",
-                           1000.0 * a.n / a.interval, a.interval / a.n, a.record / a.n, a.record_cpu / a.n,
-                           a.gpu_n ? a.gpu / a.gpu_n : 0.0,
+        // is mostly waiting for a core). "idle": the render thread waiting for the game's next
+        // frame. Median and 90th percentile of the frame time: steps of a display refresh show a
+        // frame paced by something other than the work.
+        std::sort(a.intervals.begin(), a.intervals.end());
+        const float median = a.intervals[a.intervals.size() / 2], p90 = a.intervals[a.intervals.size() * 9 / 10];
+        return fmt::format("{:.1f} fps (frame {:.2f} ms, median {:.1f}, p90 {:.1f}; record {:.2f}, cpu {:.2f}, idle {:.2f}, "
+                           "GPU {:.2f}; per frame {:.1f} draws, {:.2f} skipped, {:.2f} passes, {:.2f} barriers)",
+                           1000.0 * a.n / a.interval, a.interval / a.n, median, p90, a.record / a.n, a.record_cpu / a.n,
+                           a.idle / a.n, a.gpu_n ? a.gpu / a.gpu_n : 0.0,
                            double(a.draws) / a.n, double(a.skipped) / a.n, double(a.passes) / a.n,
                            double(a.barriers) / a.n);
       };
@@ -1913,6 +1966,11 @@ class Renderer {
   std::unique_ptr<plume::RenderCommandList> lists_[Backend::kFramesInFlight][2];
   std::unique_ptr<DeferredCommandList> deferred_;  // --gtav_native_record_thread
   std::unique_ptr<plume::RenderCommandList> present_lists_[Backend::kFramesInFlight][2];  // window copy
+  // Record workers: the command lists of a frame's chunks after the first, per slot and pair like
+  // lists_ (reset with them); chunk_used_ of them were recorded into.
+  std::vector<std::unique_ptr<plume::RenderCommandList>> chunk_lists_[Backend::kFramesInFlight][2];
+  uint32_t chunk_used_[Backend::kFramesInFlight][2] = {};
+  int32_t worker_cores_ = 0;
   int pair_[Backend::kFramesInFlight] = {};
   std::atomic<int> resetting_[Backend::kFramesInFlight][2] = {};
   struct Resetter {
