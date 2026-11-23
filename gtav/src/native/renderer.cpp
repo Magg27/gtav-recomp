@@ -67,6 +67,7 @@ REXCVAR_DEFINE_BOOL(gtav_native_exact_barriers, true, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_record_thread, false, "GTAV",
                     "Native renderer: a second thread turns the frame's commands into the Vulkan command buffer "
                     "while the render thread prepares the next draws (deferred_list.h)");
+REXCVAR_DECLARE(int32_t, gtav_native_record_workers);  // backend.cpp
 REXCVAR_DEFINE_BOOL(gtav_native_load_clears, GTAV_LOAD_CLEARS_DEFAULT, "GTAV",
                     "Native renderer: a whole-target clear at the start of a render pass becomes its load op (tile "
                     "GPUs skip loading the old contents)");
@@ -94,10 +95,10 @@ namespace plume {
 std::unique_ptr<RenderInterface> CreateVulkanInterface();  // SDL3 build: window comes later
 void SetVulkanPipelineCacheData(std::vector<uint8_t> data);  // plume-gtav.patch
 std::vector<uint8_t> GetVulkanPipelineCacheData(RenderDevice* device);
-extern uint32_t g_statRenderPasses, g_statBarriers;  // plume-gtav.patch
+extern std::atomic<uint32_t> g_statRenderPasses, g_statBarriers;  // plume-gtav.patch
 extern bool g_exactBarrierStages;
 extern bool g_clearLoadOps;
-extern uint32_t g_statLoadClears, g_statClearsInPass, g_statClearsPartial;
+extern std::atomic<uint32_t> g_statLoadClears, g_statClearsInPass, g_statClearsPartial;
 extern bool g_colorInputAttachments;
 }
 
@@ -1393,23 +1394,30 @@ class Renderer {
     }
     uint32_t front_descriptor = 0;
     auto record_start = std::chrono::steady_clock::now();
+    const double record_cpu_start = ThreadCpuMs();
     // GTAV_NATIVE_NO_BACKEND=1: present only a clear (bisects GPU hangs between the game's frame
     // and the swap chain path).
     static const bool no_backend = std::getenv("GTAV_NATIVE_NO_BACKEND") != nullptr;
     plume::RenderCommandList* record_list = list_;
-    const bool deferred = REXCVAR_GET(gtav_native_record_thread);
+    // --gtav_native_record_thread: the second thread only makes the Vulkan calls;
+    // --gtav_native_record_workers: it also finishes the draws (Backend::Execute's `stream`).
+    const bool workers = REXCVAR_GET(gtav_native_record_workers) > 0;
+    const bool deferred = workers || REXCVAR_GET(gtav_native_record_thread);
     if (deferred) {
       if (!deferred_) deferred_ = std::make_unique<DeferredCommandList>([] { PinToBigCores(); });
       deferred_->Begin(list_);
       record_list = deferred_.get();
     }
-    plume::RenderTexture* front =
-        backend_ok_ && !no_backend ? backend_.Execute(frame, record_list, &front_descriptor) : nullptr;
+    plume::RenderTexture* front = backend_ok_ && !no_backend
+                                      ? backend_.Execute(frame, record_list, &front_descriptor,
+                                                         workers ? deferred_.get() : nullptr)
+                                      : nullptr;
     if (deferred) timing_.replay_wait_sum += deferred_->Finish();
     // The frame's rendering goes to the GPU now, in a command buffer of its own; only the copy
     // into the window waits for a drawable. As one submission, the whole frame waited for the
     // swap chain image (MoltenVK: ~4 ms of GPU idle per frame on the M1).
     auto record_end = std::chrono::steady_clock::now();
+    const double record_cpu_end = ThreadCpuMs();
     if (gpu_timed_[slot]) list_->writeTimestamp(gpu_times_[slot].get(), 1);
     {
       // Ended on the submit thread: vkEndCommandBuffer finalizes the whole frame's commands (~5%
@@ -1555,6 +1563,7 @@ class Renderer {
     auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
     timing_.Add(ms(record_end - record_start), ms(wait_end - wait_start));
     last_record_ms_ = ms(record_end - record_start);
+    last_record_cpu_ms_ = record_cpu_end - record_cpu_start;
     ab_slot_phase_[slot] = ab_phase_;
     // Hitch log: a present more than 25 ms after the previous one (50 ms on phones, where 30 fps
     // frames are 33 ms: every frame was a "hitch" and the log grew by megabytes a minute), with what
@@ -1590,7 +1599,7 @@ class Renderer {
     }
   }
 
-  // GTAV_NATIVE_SHOT_DIR (+ GTAV_SHOT_SECS, default 10): periodic PPM captures of the native
+  // GTAV_NATIVE_SHOT_DIR (+ GTAV_SHOT_SECS, default 10, or GTAV_SHOT_FRAMES): periodic PPM captures of the native
   // front buffer, comparable with the emulated renderer's GTAV_SHOT_DIR captures.
   std::string ShotDir() {
     const char* dir = std::getenv("GTAV_NATIVE_SHOT_DIR");
@@ -1608,6 +1617,9 @@ class Renderer {
     if (!dir || !*dir) return false;
     const char* secs = std::getenv("GTAV_SHOT_SECS");
     uint64_t every = uint64_t(std::max(1, secs ? std::atoi(secs) : 10)) * 30;
+    // GTAV_SHOT_FRAMES: a cadence in frames (tools/native/ab_shots_diff.py wants 15).
+    if (const char* frames = std::getenv("GTAV_SHOT_FRAMES"); frames && std::atoi(frames) > 0)
+      every = uint64_t(std::atoi(frames));
     return index % every == 0;
   }
 
@@ -1757,8 +1769,8 @@ class Renderer {
                     submitter_.busy_us.exchange(0) / 1000.0 / timing_.n,
                     timing_.gpu_frames ? timing_.gpu_frame_sum / timing_.gpu_frames : 0.0,
                     timing_.gpu_frames ? timing_.gpu_gap_sum / timing_.gpu_frames : 0.0);
-        plume::g_statRenderPasses = plume::g_statBarriers = plume::g_statLoadClears = 0;
-        plume::g_statClearsInPass = plume::g_statClearsPartial = 0;
+        plume::g_statRenderPasses = 0, plume::g_statBarriers = 0, plume::g_statLoadClears = 0;
+        plume::g_statClearsInPass = 0, plume::g_statClearsPartial = 0;
         timing_ = {};
       }
     }
@@ -1768,16 +1780,19 @@ class Renderer {
   // logs per-setting averages every 1200 frames (both settings see the same scenes; the first 8
   // frames after a flip are not counted).
   struct AbStats {
-    double interval = 0, record = 0, gpu = 0;
+    double interval = 0, record = 0, record_cpu = 0, gpu = 0;
     uint32_t n = 0, gpu_n = 0;
+    // What was recorded, per side: a change that should draw the same picture keeps these equal.
+    uint64_t draws = 0, skipped = 0, passes = 0, barriers = 0;
   };
+  uint32_t ab_passes_before_ = 0, ab_barriers_before_ = 0;
   AbStats ab_[2];
   int ab_phase_ = -1;  // -1: off or warming up
   int ab_slot_phase_[Backend::kFramesInFlight] = {-1, -1};
   std::string ab_spec_, ab_name_, ab_values_[2];
   std::chrono::steady_clock::time_point ab_last_;
   uint64_t ab_frames_ = 0;
-  double last_record_ms_ = 0;
+  double last_record_ms_ = 0, last_record_cpu_ms_ = 0;
   void AbStep(uint64_t presented) {
     std::string spec = REXCVAR_GET(gtav_native_ab);
     if (spec != ab_spec_) {
@@ -1800,6 +1815,8 @@ class Renderer {
     int phase = int((k / 60) & 1);
     if (k % 60 == 0) rex::cvar::SetFlagByName(ab_name_, ab_values_[phase]);
     if (k % 60 >= 8) ab_phase_ = phase;
+    ab_passes_before_ = plume::g_statRenderPasses;
+    ab_barriers_before_ = plume::g_statBarriers;
   }
   void AbRecord(uint64_t presented) {
     auto now = std::chrono::steady_clock::now();
@@ -1807,13 +1824,25 @@ class Renderer {
       auto& a = ab_[ab_phase_];
       a.interval += std::chrono::duration<double, std::milli>(now - ab_last_).count();
       a.record += last_record_ms_;
+      a.record_cpu += last_record_cpu_ms_;
       a.n++;
+      const Backend::FrameStats st = backend_.LastStats();
+      a.draws += st.draws;
+      a.skipped += st.skipped;
+      a.passes += plume::g_statRenderPasses - ab_passes_before_;
+      a.barriers += plume::g_statBarriers - ab_barriers_before_;
     }
     ab_last_ = now;
     if (!ab_name_.empty() && ab_frames_ % 1200 == 0 && ab_[0].n && ab_[1].n) {
       auto line = [](const AbStats& a) {
-        return fmt::format("{:.1f} fps (frame {:.2f} ms, record {:.2f}, GPU {:.2f})", 1000.0 * a.n / a.interval,
-                           a.interval / a.n, a.record / a.n, a.gpu_n ? a.gpu / a.gpu_n : 0.0);
+        // "cpu": the render thread's own CPU time while recording (wall time on a loaded machine
+        // is mostly waiting for a core).
+        return fmt::format("{:.1f} fps (frame {:.2f} ms, record {:.2f}, cpu {:.2f}, GPU {:.2f}; per frame {:.1f} draws, "
+                           "{:.2f} skipped, {:.2f} passes, {:.2f} barriers)",
+                           1000.0 * a.n / a.interval, a.interval / a.n, a.record / a.n, a.record_cpu / a.n,
+                           a.gpu_n ? a.gpu / a.gpu_n : 0.0,
+                           double(a.draws) / a.n, double(a.skipped) / a.n, double(a.passes) / a.n,
+                           double(a.barriers) / a.n);
       };
       REXLOG_INFO("[native] A/B {} = {}: {} | = {}: {}", ab_name_, ab_values_[0], line(ab_[0]), ab_values_[1],
                   line(ab_[1]));

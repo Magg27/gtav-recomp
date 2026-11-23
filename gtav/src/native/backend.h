@@ -20,6 +20,7 @@ struct ImDrawData;
 namespace gtav::native {
 
 struct FramePacket;
+class DeferredCommandList;
 
 // Tree-orb diagnostic (backend.cpp DiagFor): F11 cycles the mode, logs/diag_mode sets it.
 void CycleDiagMode();
@@ -35,8 +36,10 @@ class Backend {
 
   // Records the frame into `list`. Returns the texture holding the guest front buffer (in
   // SHADER_READ layout) and its descriptor index, or nullptr when the frame has none yet.
+  // `stream`: `list` again when it is a DeferredCommandList whose replay thread may also finish
+  // the draws (--gtav_native_record_workers); the backend decides per frame whether it does.
   plume::RenderTexture* Execute(const FramePacket& frame, plume::RenderCommandList* list,
-                                uint32_t* front_descriptor);
+                                uint32_t* front_descriptor, DeferredCommandList* stream = nullptr);
 
   // Frames in flight: the renderer records frame N+1 while the GPU runs frame N. Everything a
   // frame leaves for after its fence (uploads, deferred frees, resolve writebacks) is kept per

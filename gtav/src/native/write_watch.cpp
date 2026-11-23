@@ -101,6 +101,10 @@ bool g_ready = false;
 uint64_t g_harvests = 0, g_found = 0;
 std::atomic<uint64_t> g_pages{0};
 double g_ms = 0;
+// Watch() and Pending() may be called by several recording threads at once (the render thread's
+// texture lookups, the record workers' vertex/index buffers): one at a time. Clean() only reads
+// atomics. Harvest() and Touch() stay with the render thread, between frames' recording.
+std::mutex g_watch_mutex;
 
 void Mark(uint32_t physical, uint64_t bytes, uint64_t epoch) {
   if (physical >= kPhysicalSize) return;
@@ -398,6 +402,9 @@ std::atomic<bool> g_harvest_pending{false};
 // Waits for the harvest Harvest() kicked, the first time a page epoch is consulted after it.
 void Settle() {
   if (!g_harvest_pending.load(std::memory_order_acquire)) return;
+  static std::mutex mutex;  // the first lookups of a frame may come from several threads
+  std::lock_guard lock(mutex);
+  if (!g_harvest_pending.load(std::memory_order_acquire)) return;
   auto start = std::chrono::steady_clock::now();
   g_helpers.Wait();
   g_harvest_pending.store(false, std::memory_order_release);
@@ -432,6 +439,7 @@ uint64_t Watch(uint32_t physical, uint32_t size) {
   if (uint64_t(physical) + size > kPhysicalSize) return 0;
 #if GTAV_WW_UFFD
   Settle();  // the scans read g_interest and store page epochs: no new interest while they run
+  std::lock_guard lock(g_watch_mutex);
   // Pages no copy was made from yet are not protected: protect them in every view (before the
   // caller reads them). UFFDIO_WRITEPROTECT also covers pages without page tables yet.
   uint32_t first = physical >> kPageShift, last = (physical + size - 1) >> kPageShift;
@@ -464,6 +472,8 @@ uint64_t Watch(uint32_t physical, uint32_t size) {
   return g_epoch.load(std::memory_order_acquire);
 #elif GTAV_WW_PAGEPROT
   if (physical < kUnwatchedBelow) return 0;
+  // (Also so that a second thread finding a page armed can rely on it being protected already.)
+  std::lock_guard lock(g_watch_mutex);
   // The epoch is taken before arming: a write that faults after arming gets a later one.
   uint64_t epoch = g_epoch.load(std::memory_order_acquire);
   uint32_t first = physical >> kPageShift, last = (physical + size - 1) >> kPageShift;
@@ -490,6 +500,7 @@ bool Pending(uint32_t physical, uint32_t size) {
   Settle();
   physical &= kPhysicalSize - 1;
   auto* mem = REX_KERNEL_MEMORY();
+  std::lock_guard lock(g_watch_mutex);
   g_found = 0;
   for (uint32_t i = 0; i < g_view_count; i++) {
     const View& v = g_views[i];

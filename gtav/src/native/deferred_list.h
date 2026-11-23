@@ -35,6 +35,15 @@ class DeferredCommandList final : public plume::RenderCommandList {
   // ms the replay thread spent replaying since the last call.
   double TakeBusyMs();
 
+  // Records of the caller's own, between the plume calls: `fn(context, target, kind, payload)` runs
+  // on the replay thread when the stream reaches the record (the backend's half-recorded draws,
+  // see Backend::Impl::DrawBack). AppendUser returns `size` bytes (8-byte aligned) to fill, then
+  // PublishUser() hands the record over.
+  using UserFn = void (*)(void* context, plume::RenderCommandList* target, uint32_t kind, const void* payload);
+  void SetUser(UserFn fn, void* context) { user_fn_ = fn, user_context_ = context; }
+  void* AppendUser(uint32_t kind, uint32_t size);
+  void PublishUser() { Publish(); }
+
   void begin() override {}
   void end() override {}
   void barriers(plume::RenderBarrierStages stages, const plume::RenderBufferBarrier* bufferBarriers,
@@ -119,6 +128,8 @@ class DeferredCommandList final : public plume::RenderCommandList {
   void Replay(const Header* h);
 
   plume::RenderCommandList* target_ = nullptr;
+  UserFn user_fn_ = nullptr;
+  void* user_context_ = nullptr;
   std::array<Block, kBlocks> blocks_;
   // Producer side.
   uint32_t write_block_ = 0, write_offset_ = 0;

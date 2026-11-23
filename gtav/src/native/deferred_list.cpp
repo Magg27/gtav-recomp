@@ -49,6 +49,7 @@ enum class DeferredCommandList::Op : uint16_t {
   BeginOcclusionQuery,
   EndOcclusionQuery,
   SetFragmentShadingRate,
+  User,  // Header::pad: the caller's kind
 };
 
 namespace {
@@ -193,6 +194,12 @@ uint8_t* DeferredCommandList::Append(Op op, uint32_t payload) {
   h->size = size;
   write_offset_ += size;
   return reinterpret_cast<uint8_t*>(h + 1);
+}
+
+void* DeferredCommandList::AppendUser(uint32_t kind, uint32_t size) {
+  uint8_t* p = Append(Op::User, size);
+  (reinterpret_cast<Header*>(p) - 1)->pad = uint16_t(kind);
+  return p;
 }
 
 void DeferredCommandList::Publish() {
@@ -439,6 +446,9 @@ void DeferredCommandList::Replay(const Header* h) {
       t->setFragmentShadingRate(r.a, r.b);
       break;
     }
+    case Op::User:
+      user_fn_(user_context_, t, h->pad, p);
+      break;
   }
 }
 

@@ -7,6 +7,7 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <time.h>
 #endif
 
 namespace gtav::native {
@@ -21,6 +22,16 @@ inline void NameThread(const char* name) {  // at most 15 characters on Linux
   pthread_setname_np(name);
 #else
   pthread_setname_np(pthread_self(), name);
+#endif
+}
+// CPU time the calling thread has used, in ms (0 where there is no cheap per-thread clock).
+inline double ThreadCpuMs() {
+#if defined(_WIN32)
+  return 0.0;
+#else
+  timespec ts{};
+  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0.0;
+  return double(ts.tv_sec) * 1e3 + double(ts.tv_nsec) * 1e-6;
 #endif
 }
 }  // namespace gtav::native
