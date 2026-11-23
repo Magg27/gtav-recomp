@@ -1017,7 +1017,7 @@ index 20a2cd8..2689059 100644
      }
    }
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index 11b83be..03b95e1 100644
+index 11b83be..279389d 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
 @@ -9,12 +9,20 @@
@@ -1041,7 +1041,7 @@ index 11b83be..03b95e1 100644
  #include <rex/dbg.h>
  #include <rex/logging.h>
  #include <rex/memory/ring_buffer.h>
-@@ -36,10 +44,147 @@ extern "C" {
+@@ -36,10 +44,149 @@ extern "C" {
  // Credits for most of this code goes to:
  // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
  
@@ -1138,6 +1138,8 @@ index 11b83be..03b95e1 100644
 +    std::thread([this] { Run(); }).detach();
 +  }
 +  void Run() {
++    // Named (it inherited the audio thread's name): the title can then keep it off the fast cores.
++    rex::thread::set_current_thread_name("xma-fresh");
 +    std::unique_lock lock(mutex_);
 +    for (;;) {
 +      cv_.wait(lock, [&] { return !to_free_.empty() || Missing() != nullptr; });
@@ -1189,7 +1191,7 @@ index 11b83be..03b95e1 100644
  const uint32_t XmaContext::kBitsPerPacketHeader;
  const uint32_t XmaContext::kOutputMaxSizeBytes;
  
-@@ -50,6 +195,9 @@ XmaContext::~XmaContext() {
+@@ -50,6 +197,9 @@ XmaContext::~XmaContext() {
    if (av_context_) {
      avcodec_free_context(&av_context_);
    }
@@ -1199,7 +1201,7 @@ index 11b83be..03b95e1 100644
    if (av_frame_) {
      av_frame_free(&av_frame_);
    }
-@@ -98,25 +246,90 @@ bool XmaContext::Work() {
+@@ -98,25 +248,90 @@ bool XmaContext::Work() {
    }
  
    std::lock_guard<std::mutex> lock(lock_);
@@ -1291,7 +1293,7 @@ index 11b83be..03b95e1 100644
      StoreContextMerged(data, initial_data, context_ptr);
      return true;
    }
-@@ -132,22 +345,100 @@ bool XmaContext::Work() {
+@@ -132,22 +347,100 @@ bool XmaContext::Work() {
      return true;
    }
  
@@ -1395,7 +1397,7 @@ index 11b83be..03b95e1 100644
    return true;
  }
  
-@@ -192,13 +483,16 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
+@@ -192,13 +485,16 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
  void XmaContext::ResetDecoderState() {
    // A freed or re-initialized context is a new logical stream, so the previous
    // wave's MDCT overlap-add tail must not survive into frame 0 of the next one.
@@ -1419,7 +1421,7 @@ index 11b83be..03b95e1 100644
    }
    raw_frame_.fill(0);
    decoded_frame_.fill(0);
-@@ -226,7 +520,69 @@ void XmaContext::Release() {
+@@ -226,7 +522,69 @@ void XmaContext::Release() {
    std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));
  }
  
@@ -1489,7 +1491,7 @@ index 11b83be..03b95e1 100644
    if (data->current_buffer == 0) {
      data->input_buffer_0_valid = 0;
    } else {
-@@ -339,8 +695,13 @@ memory::RingBuffer XmaContext::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
+@@ -339,8 +697,13 @@ memory::RingBuffer XmaContext::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
    memory::RingBuffer output_rb(output_buffer, output_capacity);
    output_rb.set_read_offset(output_read_offset);
    output_rb.set_write_offset(output_write_offset);
@@ -1505,7 +1507,7 @@ index 11b83be..03b95e1 100644
  
    return output_rb;
  }
-@@ -414,10 +775,31 @@ void XmaContext::StoreContextMerged(const XMA_CONTEXT_DATA& data,
+@@ -414,10 +777,31 @@ void XmaContext::StoreContextMerged(const XMA_CONTEXT_DATA& data,
      fresh.output_buffer_valid = 0;
    }
  
@@ -1540,7 +1542,7 @@ index 11b83be..03b95e1 100644
  
    fresh.Store(context_ptr);
  }
-@@ -476,7 +858,30 @@ int XmaContext::PrepareDecoder(int sample_rate, bool is_two_channel) {
+@@ -476,7 +860,30 @@ int XmaContext::PrepareDecoder(int sample_rate, bool is_two_channel) {
        av_context_->channels != static_cast<int>(channels)) {
      REXAPU_NOISY_DEBUG("XmaContext {}: Codec reinit: rate {} -> {}, channels {} -> {}", id(),
                         av_context_->sample_rate, sample_rate, av_context_->channels, channels);
@@ -1572,7 +1574,7 @@ index 11b83be..03b95e1 100644
      av_context_ = avcodec_alloc_context3(av_codec_);
  
      av_context_->sample_rate = sample_rate;
-@@ -667,9 +1072,48 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -667,9 +1074,48 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
    }
    PreparePacket(packet_info.current_frame_size_, padding_start);
    const bool decoded = DecodePacket(av_context_, av_packet_, av_frame_);
@@ -1622,7 +1624,7 @@ index 11b83be..03b95e1 100644
      // Realign the decoder's output onto the bitstream's sample numbering: the
      // samples of the frame just decoded run from kDecoderStartPadding into this
 diff --git a/src/audio/xma_decoder.cpp b/src/audio/xma_decoder.cpp
-index a0a178d..9bf7599 100644
+index a0a178d..f384876 100644
 --- a/src/audio/xma_decoder.cpp
 +++ b/src/audio/xma_decoder.cpp
 @@ -12,6 +12,14 @@
@@ -1640,7 +1642,17 @@ index a0a178d..9bf7599 100644
  #include <rex/dbg.h>
  #include <rex/logging.h>
  #include <rex/perf/counter.h>
-@@ -134,6 +142,16 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
+@@ -27,6 +35,9 @@ extern "C" {
+ }  // extern "C"
+ 
+ REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debug and above)");
++REXCVAR_DEFINE_BOOL(xma_kick_wakes_worker, false, "Audio",
++                    "A context kick also wakes the XMA worker thread although the kick decodes inline "
++                    "(the old behaviour; live)");
+ 
+ // As with normal Microsoft, there are like twelve different ways to access
+ // the audio APIs. Early games use XMA*() methods almost exclusively to touch
+@@ -134,6 +145,16 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
  
    worker_thread_->Create();
  
@@ -1657,7 +1669,7 @@ index a0a178d..9bf7599 100644
    return X_STATUS_SUCCESS;
  }
  
-@@ -151,6 +169,18 @@ void XmaDecoder::WorkerThreadMain() {
+@@ -151,6 +172,18 @@ void XmaDecoder::WorkerThreadMain() {
        did_work = did_work || worked;
      }
  
@@ -1676,7 +1688,7 @@ index a0a178d..9bf7599 100644
      if (paused_) {
        pause_fence_.Signal();
        resume_fence_.Wait();
-@@ -159,8 +189,13 @@ void XmaDecoder::WorkerThreadMain() {
+@@ -159,8 +192,13 @@ void XmaDecoder::WorkerThreadMain() {
      if (did_work) {
        continue;
      }
@@ -1692,7 +1704,7 @@ index a0a178d..9bf7599 100644
    }
  }
  
-@@ -290,6 +325,11 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+@@ -290,6 +328,11 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
        if (value & 1) {
          uint32_t context_id = base_context_id + i;
          auto& context = contexts_[context_id];
@@ -1704,7 +1716,7 @@ index a0a178d..9bf7599 100644
          context.Enable();
        }
      }
-@@ -299,9 +339,8 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+@@ -299,12 +342,14 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
        if (kicked_value & 1) {
          uint32_t context_id = base_context_id + i;
          auto& context = contexts_[context_id];
@@ -1715,8 +1727,15 @@ index a0a178d..9bf7599 100644
 +        context.SignalWorkDone();  // a kick always completes (Work may report no progress)
        }
      }
-     work_event_->Set();
-@@ -314,6 +353,11 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+-    work_event_->Set();
++    // The kicked contexts were just decoded here and, without persistent enables, are no longer
++    // enabled: waking the worker only made it sweep all the contexts for nothing (S23 FE: ~3,700
++    // wakeups a second, 10% of a core, and 10% of the audio thread spent in the wake call).
++    if (REXCVAR_GET(xma_persistent_enable) || REXCVAR_GET(xma_kick_wakes_worker)) work_event_->Set();
+   } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {
+     // Context lock command.
+     // This requests a lock by flagging the context.
+@@ -314,6 +359,11 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
        if (value & 1) {
          uint32_t context_id = base_context_id + i;
          auto& context = contexts_[context_id];
@@ -1728,7 +1747,7 @@ index a0a178d..9bf7599 100644
          context.Disable();
          // [XMA fix] Added Block(false) after Disable(). Without this, the game
          // could call XMADisableContext and start modifying the context struct
-@@ -332,6 +376,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+@@ -332,6 +382,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
        if (value & 1) {
          uint32_t context_id = base_context_id + i;
          XmaContext& context = contexts_[context_id];
@@ -2457,10 +2476,16 @@ index 5e0a932..cd75b74 100644
  
  bool& seh_active() {
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 9ac8d15..4f692bc 100644
+index 9ac8d15..e2c0e6c 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
-@@ -41,15 +41,18 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+@@ -36,20 +36,24 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #include <unistd.h>
+ 
+ #include <rex/assert.h>
++#include <rex/cvar.h>
+ #include <rex/chrono/chrono_steady_cast.h>
+ #include <rex/logging.h>
  #include <rex/thread/timer_queue.h>
  
  #include <sched.h>
@@ -2482,7 +2507,25 @@ index 9ac8d15..4f692bc 100644
  // SIGEV_THREAD_ID in timer_create(...) is a Linux extension
  #define REX_HAS_SIGEV_THREAD_ID 1
  #ifdef __GLIBC__
-@@ -65,30 +68,14 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+@@ -62,33 +66,32 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #define REX_HAS_SIGEV_THREAD_ID 0
+ #endif
+ 
++// A semaphore release or an auto-reset event used to wake every thread waiting on the handle
++// (notify_all), and each acquisition of a semaphore woke the rest once more; all but one went
++// straight back to sleep. GTA V's main thread releases its job semaphore ~2,000 times a second
++// with four workers waiting on it: S23 FE, 14% of the main thread's CPU time was the wake calls.
++REXCVAR_DEFINE_BOOL(posix_wake_one, true, "Kernel",
++                    "A semaphore release of one or an auto-reset event wakes one waiter instead of all "
++                    "of them (live)");
++// Alertable waits with a timeout cut the time left to whole milliseconds, and 0 means "do not
++// block": the last partial millisecond of every such wait, and all of a 1 ms wait, was a busy
++// loop on the clock. The GPU command thread idles in 1 ms alertable waits: S23 FE, 67% of its
++// samples (30% of a big core) were clock_gettime.
++REXCVAR_DEFINE_BOOL(posix_alertable_sleep, true, "Kernel",
++                    "Alertable waits sleep through the last partial millisecond of a timeout instead "
++                    "of spinning on the clock (live)");
++
  namespace rex::thread {
  
  #if REX_PLATFORM_ANDROID
@@ -2519,7 +2562,7 @@ index 9ac8d15..4f692bc 100644
  #endif
  
  template <typename _Rep, typename _Period>
-@@ -267,10 +254,35 @@ static sem_t* RexCreateAnonymousSemaphore() {
+@@ -267,10 +270,35 @@ static sem_t* RexCreateAnonymousSemaphore() {
  }
  #endif  // __APPLE__
  
@@ -2556,7 +2599,7 @@ index 9ac8d15..4f692bc 100644
      // Use robust mutexes so waits can recover if owner thread terminates.
      pthread_mutexattr_t attr;
      if (pthread_mutexattr_init(&attr) == 0) {
-@@ -290,7 +302,7 @@ class PosixConditionBase {
+@@ -290,7 +318,7 @@ class PosixConditionBase {
    WaitResult Wait(std::chrono::milliseconds timeout) {
      bool executed;
      auto predicate = [this] { return this->signaled(); };
@@ -2565,7 +2608,7 @@ index 9ac8d15..4f692bc 100644
      auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
      int lock_result = pthread_mutex_lock(native_mutex);
      if (lock_result == EOWNERDEAD) {
-@@ -330,12 +342,28 @@ class PosixConditionBase {
+@@ -330,12 +358,28 @@ class PosixConditionBase {
        return std::make_pair(result, 0);
      }
  
@@ -2594,7 +2637,7 @@ index 9ac8d15..4f692bc 100644
        size_t first_signaled = std::numeric_limits<size_t>::max();
        bool condition_met = false;
        bool all_locked = true;
-@@ -344,7 +372,7 @@ class PosixConditionBase {
+@@ -344,7 +388,7 @@ class PosixConditionBase {
        locks.reserve(handles.size());
  
        for (size_t i = 0; i < handles.size(); ++i) {
@@ -2603,7 +2646,7 @@ index 9ac8d15..4f692bc 100644
          auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
          int result = pthread_mutex_trylock(native_mutex);
          if (result == 0 || result == EOWNERDEAD) {
-@@ -411,6 +439,19 @@ class PosixConditionBase {
+@@ -411,6 +455,19 @@ class PosixConditionBase {
          return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
        }
  
@@ -2623,7 +2666,7 @@ index 9ac8d15..4f692bc 100644
        if (timeout == std::chrono::milliseconds::max()) {
          std::this_thread::sleep_for(std::chrono::milliseconds(1));
        } else {
-@@ -418,6 +459,7 @@ class PosixConditionBase {
+@@ -418,6 +475,7 @@ class PosixConditionBase {
          auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
          std::this_thread::sleep_for(sleep_time);
        }
@@ -2631,23 +2674,47 @@ index 9ac8d15..4f692bc 100644
      }
    }
  
-@@ -450,6 +492,7 @@ class PosixCondition<Event> : public PosixConditionBase {
+@@ -449,7 +507,14 @@ class PosixCondition<Event> : public PosixConditionBase {
+   bool Signal() override {
      auto lock = std::unique_lock<std::mutex>(mutex_);
      signal_ = true;
-     cond_.notify_all();
+-    cond_.notify_all();
++    // An auto-reset event serves one waiter (the first to run takes it; a second Set meanwhile
++    // wakes another, which finds it taken and waits again, as before).
++    if (!manual_reset_ && REXCVAR_GET(posix_wake_one)) {
++      cond_.notify_one();
++    } else {
++      cond_.notify_all();
++    }
 +    NotifyMultiWaiters();
      return true;
    }
  
-@@ -487,6 +530,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+@@ -486,7 +551,12 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+       *out_previous_count = count_;
      }
      count_ += release_count;
-     cond_.notify_all();
+-    cond_.notify_all();
++    if (release_count == 1 && REXCVAR_GET(posix_wake_one)) {
++      cond_.notify_one();
++    } else {
++      cond_.notify_all();
++    }
 +    NotifyMultiWaiters();
      return true;
    }
  
-@@ -519,6 +563,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
+@@ -494,7 +564,8 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+   inline bool signaled() const override { return count_ > 0; }
+   inline void post_execution() override {
+     count_--;
+-    cond_.notify_all();
++    // (Taking a count cannot make the handle signaled for anyone else: nothing to wake.)
++    if (!REXCVAR_GET(posix_wake_one)) cond_.notify_all();
+   }
+   uint32_t count_;
+   const uint32_t maximum_count_;
+@@ -519,6 +590,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
        // Free to be acquired by another thread
        if (count_ == 0) {
          cond_.notify_all();
@@ -2655,7 +2722,7 @@ index 9ac8d15..4f692bc 100644
        }
        return true;
      }
-@@ -551,6 +596,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
+@@ -551,6 +623,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
      std::lock_guard<std::mutex> lock(mutex_);
      signal_ = true;
      cond_.notify_all();
@@ -2663,7 +2730,7 @@ index 9ac8d15..4f692bc 100644
      return true;
    }
  
-@@ -979,6 +1025,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -979,6 +1052,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
        exit_code_ = exit_code;
        signaled_ = true;
        cond_.notify_all();
@@ -2671,7 +2738,26 @@ index 9ac8d15..4f692bc 100644
      }
      if (is_current_thread) {
        pthread_exit(reinterpret_cast<void*>(exit_code));
-@@ -1405,6 +1452,30 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1106,11 +1180,15 @@ std::chrono::milliseconds ComputeAlertableWaitTimeout(
+   if (deadline == std::chrono::steady_clock::time_point::max()) {
+     return kAlertablePollSlice;
+   }
+-  auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+-      deadline - std::chrono::steady_clock::now());
+-  if (remaining <= std::chrono::milliseconds::zero()) {
++  const auto left = deadline - std::chrono::steady_clock::now();
++  if (left <= std::chrono::steady_clock::duration::zero()) {
+     return std::chrono::milliseconds::zero();
+   }
++  // Rounded up: a wait of 0 ms does not block, so rounding down turned the last partial
++  // millisecond into a busy loop.
++  const auto remaining = REXCVAR_GET(posix_alertable_sleep)
++                             ? std::chrono::ceil<std::chrono::milliseconds>(left)
++                             : std::chrono::duration_cast<std::chrono::milliseconds>(left);
+   return std::min(remaining, kAlertablePollSlice);
+ }
+ 
+@@ -1405,6 +1483,30 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
    }
  #endif
    set_current_thread_name("");
@@ -2702,7 +2788,7 @@ index 9ac8d15..4f692bc 100644
  
    auto start_data = static_cast<ThreadStartData*>(parameter);
    assert_not_null(start_data);
-@@ -1449,6 +1520,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1449,6 +1551,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
      thread->handle_.exit_code_ = 0;
      thread->handle_.signaled_ = true;
      thread->handle_.cond_.notify_all();

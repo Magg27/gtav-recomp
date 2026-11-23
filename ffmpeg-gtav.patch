@@ -1,8 +1,325 @@
+diff --git a/libavcodec/fft_template.c b/libavcodec/fft_template.c
+index 69f0a64..860e269 100644
+--- a/libavcodec/fft_template.c
++++ b/libavcodec/fft_template.c
+@@ -209,9 +209,60 @@ static av_cold void fft_perm_avx(FFTContext *s)
+     }
+ }
+ 
++/* gtav: an FFT's bit-reversal table depends only on its size, direction and permutation, and
++ * computing it is a large part of what opening a WMA Pro / XMA decoder costs (GTA V opens a
++ * fresh decoder for every sound it starts: a third of a phone core went into these tables).
++ * Each kind is computed once, shared by every context and never freed. */
++static AVMutex revtab_cache_mutex = AV_MUTEX_INITIALIZER;
++static void *revtab_cache[18][2][3]; /* [nbits][inverse][permutation] */
++
++static void **revtab_cache_slot(const FFTContext *s)
++{
++    if (s->nbits < 2 || s->nbits > 17 || (s->inverse != 0 && s->inverse != 1) ||
++        (int)s->fft_permutation < 0 || (int)s->fft_permutation > 2)
++        return NULL;
++    return &revtab_cache[s->nbits][s->inverse][s->fft_permutation];
++}
++
++static int revtab_is_cached(const void *table)
++{
++    int found = 0;
++    if (!table)
++        return 0;
++    ff_mutex_lock(&revtab_cache_mutex);
++    for (int a = 0; a < 18 && !found; a++)
++        for (int b = 0; b < 2 && !found; b++)
++            for (int c = 0; c < 3; c++)
++                if (revtab_cache[a][b][c] == table) {
++                    found = 1;
++                    break;
++                }
++    ff_mutex_unlock(&revtab_cache_mutex);
++    return found;
++}
++
++/* The context's freshly allocated table gives way to the shared one, or becomes it. */
++static void revtab_cache_use(FFTContext *s, void **slot, int publish)
++{
++    ff_mutex_lock(&revtab_cache_mutex);
++    if (*slot) {
++        if (s->revtab) {
++            av_free(s->revtab);
++            s->revtab = *slot;
++        } else {
++            av_free(s->revtab32);
++            s->revtab32 = *slot;
++        }
++    } else if (publish) {
++        *slot = s->revtab ? (void *)s->revtab : (void *)s->revtab32;
++    }
++    ff_mutex_unlock(&revtab_cache_mutex);
++}
++
+ av_cold int ff_fft_init(FFTContext *s, int nbits, int inverse)
+ {
+     int i, j, n;
++    void **cache_slot;
+ 
+     s->revtab = NULL;
+     s->revtab32 = NULL;
+@@ -262,6 +313,14 @@ av_cold int ff_fft_init(FFTContext *s, int nbits, int inverse)
+ #endif /* FFT_FIXED_32 */
+ 
+ 
++    cache_slot = revtab_cache_slot(s);
++    if (cache_slot) {
++        const void *fresh = s->revtab ? (void *)s->revtab : (void *)s->revtab32;
++        revtab_cache_use(s, cache_slot, 0);
++        if (fresh != (s->revtab ? (void *)s->revtab : (void *)s->revtab32))
++            return 0; /* the shared table */
++    }
++
+     if (ARCH_X86 && FFT_FLOAT && s->fft_permutation == FF_FFT_PERM_AVX) {
+         fft_perm_avx(s);
+     } else {
+@@ -302,6 +361,8 @@ av_cold int ff_fft_init(FFTContext *s, int nbits, int inverse)
+ #undef SPLIT_RADIX_PERMUTATION
+     }
+ 
++    if (cache_slot)
++        revtab_cache_use(s, cache_slot, 1);
+     return 0;
+  fail:
+     av_freep(&s->revtab);
+@@ -327,6 +388,10 @@ static void fft_permute_c(FFTContext *s, FFTComplex *z)
+ 
+ av_cold void ff_fft_end(FFTContext *s)
+ {
++    if (revtab_is_cached(s->revtab))
++        s->revtab = NULL;
++    if (revtab_is_cached(s->revtab32))
++        s->revtab32 = NULL;
+     av_freep(&s->revtab);
+     av_freep(&s->revtab32);
+     av_freep(&s->tmp_buf);
+diff --git a/libavcodec/mdct_template.c b/libavcodec/mdct_template.c
+index ca2e308..0cdb10f 100644
+--- a/libavcodec/mdct_template.c
++++ b/libavcodec/mdct_template.c
+@@ -24,6 +24,7 @@
+ #include "libavutil/common.h"
+ #include "libavutil/libm.h"
+ #include "libavutil/mathematics.h"
++#include "libavutil/thread.h"
+ #include "fft.h"
+ #include "fft-internal.h"
+ 
+@@ -56,11 +57,61 @@ double cosfast(double x)
+ /**
+  * init MDCT or IMDCT computation.
+  */
++/* gtav: the MDCT's cos/sin table depends only on its size, scale and layout; see the note at
++ * ff_fft_init. Computed once per kind, shared, never freed. A full cache just stops caching. */
++static AVMutex tcos_cache_mutex = AV_MUTEX_INITIALIZER;
++static struct {
++    int nbits, permutation;
++    double scale;
++    FFTSample *tcos;
++} tcos_cache[64];
++static int tcos_cache_count;
++
++/* The shared table for the key; with `fresh`, publishes it when there is none yet. */
++static FFTSample *tcos_cache_get(int nbits, int permutation, double scale, FFTSample *fresh)
++{
++    FFTSample *found = NULL;
++    ff_mutex_lock(&tcos_cache_mutex);
++    for (int i = 0; i < tcos_cache_count; i++)
++        if (tcos_cache[i].nbits == nbits && tcos_cache[i].permutation == permutation &&
++            tcos_cache[i].scale == scale) {
++            found = tcos_cache[i].tcos;
++            break;
++        }
++    if (!found && fresh && tcos_cache_count < FF_ARRAY_ELEMS(tcos_cache)) {
++        tcos_cache[tcos_cache_count].nbits       = nbits;
++        tcos_cache[tcos_cache_count].permutation = permutation;
++        tcos_cache[tcos_cache_count].scale       = scale;
++        tcos_cache[tcos_cache_count].tcos        = fresh;
++        tcos_cache_count++;
++        found = fresh;
++    }
++    ff_mutex_unlock(&tcos_cache_mutex);
++    return found;
++}
++
++static int tcos_is_cached(const FFTSample *tcos)
++{
++    int found = 0;
++    if (!tcos)
++        return 0;
++    ff_mutex_lock(&tcos_cache_mutex);
++    for (int i = 0; i < tcos_cache_count; i++)
++        if (tcos_cache[i].tcos == tcos) {
++            found = 1;
++            break;
++        }
++    ff_mutex_unlock(&tcos_cache_mutex);
++    return found;
++}
++
+ av_cold int ff_mdct_init(FFTContext *s, int nbits, int inverse, double scale)
+ {
+     int n, n4, i;
+     double alpha, theta;
+     int tstep;
++    const double key_scale = scale;
++    FFTSample *shared;
+ 
+     memset(s, 0, sizeof(*s));
+     n = 1 << nbits;
+@@ -72,7 +123,8 @@ av_cold int ff_mdct_init(FFTContext *s, int nbits, int inverse, double scale)
+     if (ff_fft_init(s, s->mdct_bits - 2, inverse) < 0)
+         goto fail;
+ 
+-    s->tcos = av_malloc_array(n/2, sizeof(FFTSample));
++    shared = tcos_cache_get(nbits, s->mdct_permutation, key_scale, NULL);
++    s->tcos = shared ? shared : av_malloc_array(n/2, sizeof(FFTSample));
+     if (!s->tcos)
+         goto fail;
+ 
+@@ -89,6 +141,9 @@ av_cold int ff_mdct_init(FFTContext *s, int nbits, int inverse, double scale)
+         goto fail;
+     }
+ 
++    if (shared)
++        return 0;
++
+     theta = 1.0 / 8.0 + (scale < 0 ? n4 : 0);
+     scale = sqrt(fabs(scale));
+     for(i=0;i<n4;i++) {
+@@ -101,6 +156,13 @@ av_cold int ff_mdct_init(FFTContext *s, int nbits, int inverse, double scale)
+         s->tsin[i*tstep] = FIX15(-sin(alpha) * scale);
+ #endif
+     }
++    shared = tcos_cache_get(nbits, s->mdct_permutation, key_scale, s->tcos);
++    if (shared && shared != s->tcos) { /* another thread published the same table first */
++        const ptrdiff_t tsin_offset = s->tsin - s->tcos;
++        av_free(s->tcos);
++        s->tcos = shared;
++        s->tsin = shared + tsin_offset;
++    }
+     return 0;
+  fail:
+     ff_mdct_end(s);
+@@ -219,6 +281,8 @@ void ff_mdct_calc_c(FFTContext *s, FFTSample *out, const FFTSample *input)
+ 
+ av_cold void ff_mdct_end(FFTContext *s)
+ {
++    if (tcos_is_cached(s->tcos))
++        s->tcos = NULL;
+     av_freep(&s->tcos);
+     ff_fft_end(s);
+ }
 diff --git a/libavcodec/wmaprodec.c b/libavcodec/wmaprodec.c
-index 704c0a4..85ae853 100644
+index 704c0a4..b632152 100644
 --- a/libavcodec/wmaprodec.c
 +++ b/libavcodec/wmaprodec.c
-@@ -2025,6 +2025,33 @@ static av_cold int xmaframes_decode_init(AVCodecContext* avctx)
+@@ -93,6 +93,7 @@
+ #include "libavutil/intfloat.h"
+ #include "libavutil/intreadwrite.h"
+ #include "libavutil/mem_internal.h"
++#include "libavutil/thread.h"
+ 
+ #include "avcodec.h"
+ #include "internal.h"
+@@ -314,8 +315,45 @@ static av_cold int get_rate(AVCodecContext *avctx)
+  *@param avctx codec context
+  *@return 0 on success, -1 otherwise
+  */
++/* gtav: these tables are static; every decoder open rebuilt them in place (16% of an open). */
++static av_cold void decode_init_static(void)
++{
++    INIT_VLC_STATIC(&sf_vlc, SCALEVLCBITS, HUFF_SCALE_SIZE,
++                    scale_huffbits, 1, 1,
++                    scale_huffcodes, 2, 2, 616);
++
++    INIT_VLC_STATIC(&sf_rl_vlc, VLCBITS, HUFF_SCALE_RL_SIZE,
++                    scale_rl_huffbits, 1, 1,
++                    scale_rl_huffcodes, 4, 4, 1406);
++
++    INIT_VLC_STATIC(&coef_vlc[0], VLCBITS, HUFF_COEF0_SIZE,
++                    coef0_huffbits, 1, 1,
++                    coef0_huffcodes, 4, 4, 2108);
++
++    INIT_VLC_STATIC(&coef_vlc[1], VLCBITS, HUFF_COEF1_SIZE,
++                    coef1_huffbits, 1, 1,
++                    coef1_huffcodes, 4, 4, 3912);
++
++    INIT_VLC_STATIC(&vec4_vlc, VLCBITS, HUFF_VEC4_SIZE,
++                    vec4_huffbits, 1, 1,
++                    vec4_huffcodes, 2, 2, 604);
++
++    INIT_VLC_STATIC(&vec2_vlc, VLCBITS, HUFF_VEC2_SIZE,
++                    vec2_huffbits, 1, 1,
++                    vec2_huffcodes, 2, 2, 562);
++
++    INIT_VLC_STATIC(&vec1_vlc, VLCBITS, HUFF_VEC1_SIZE,
++                    vec1_huffbits, 1, 1,
++                    vec1_huffcodes, 2, 2, 562);
++
++    /** calculate sine values for the decorrelation matrix */
++    for (int i = 0; i < 33; i++)
++        sin64[i] = sin(i*M_PI / 64.0);
++}
++
+ static av_cold int decode_init(WMAProDecodeCtx *s, AVCodecContext *avctx, int num_stream)
+ {
++    static AVOnce init_static_once = AV_ONCE_INIT;
+     uint8_t *edata_ptr = avctx->extradata;
+     unsigned int channel_mask;
+     int i, bits;
+@@ -467,33 +505,7 @@ static av_cold int decode_init(WMAProDecodeCtx *s, AVCodecContext *avctx, int nu
+         }
+     }
+ 
+-    INIT_VLC_STATIC(&sf_vlc, SCALEVLCBITS, HUFF_SCALE_SIZE,
+-                    scale_huffbits, 1, 1,
+-                    scale_huffcodes, 2, 2, 616);
+-
+-    INIT_VLC_STATIC(&sf_rl_vlc, VLCBITS, HUFF_SCALE_RL_SIZE,
+-                    scale_rl_huffbits, 1, 1,
+-                    scale_rl_huffcodes, 4, 4, 1406);
+-
+-    INIT_VLC_STATIC(&coef_vlc[0], VLCBITS, HUFF_COEF0_SIZE,
+-                    coef0_huffbits, 1, 1,
+-                    coef0_huffcodes, 4, 4, 2108);
+-
+-    INIT_VLC_STATIC(&coef_vlc[1], VLCBITS, HUFF_COEF1_SIZE,
+-                    coef1_huffbits, 1, 1,
+-                    coef1_huffcodes, 4, 4, 3912);
+-
+-    INIT_VLC_STATIC(&vec4_vlc, VLCBITS, HUFF_VEC4_SIZE,
+-                    vec4_huffbits, 1, 1,
+-                    vec4_huffcodes, 2, 2, 604);
+-
+-    INIT_VLC_STATIC(&vec2_vlc, VLCBITS, HUFF_VEC2_SIZE,
+-                    vec2_huffbits, 1, 1,
+-                    vec2_huffcodes, 2, 2, 562);
+-
+-    INIT_VLC_STATIC(&vec1_vlc, VLCBITS, HUFF_VEC1_SIZE,
+-                    vec1_huffbits, 1, 1,
+-                    vec1_huffcodes, 2, 2, 562);
++    ff_thread_once(&init_static_once, decode_init_static);
+ 
+     /** calculate number of scale factor bands and their offsets
+         for every possible block size */
+@@ -570,10 +582,6 @@ static av_cold int decode_init(WMAProDecodeCtx *s, AVCodecContext *avctx, int nu
+         s->subwoofer_cutoffs[i] = av_clip(cutoff, 4, block_size);
+     }
+ 
+-    /** calculate sine values for the decorrelation matrix */
+-    for (i = 0; i < 33; i++)
+-        sin64[i] = sin(i*M_PI / 64.0);
+-
+     if (avctx->debug & FF_DEBUG_BITSTREAM)
+         dump_context(s);
+ 
+@@ -2025,6 +2033,33 @@ static av_cold int xmaframes_decode_init(AVCodecContext* avctx)
      return decode_init(s, avctx, 0);
  }
  
@@ -36,7 +353,7 @@ index 704c0a4..85ae853 100644
  static av_cold int xmaframes_decode_end(AVCodecContext* avctx)
  {
      WMAProDecodeCtx *s = avctx->priv_data;
-@@ -2152,6 +2179,7 @@ AVCodec ff_xmaframes_decoder = {
+@@ -2152,6 +2187,7 @@ AVCodec ff_xmaframes_decoder = {
      .init           = xmaframes_decode_init,
      .close          = xmaframes_decode_end,
      .decode         = xmaframes_decode_packet,
