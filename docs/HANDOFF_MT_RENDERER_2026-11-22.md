@@ -68,6 +68,9 @@ own CPU time (0 on Windows).
 - Vulkan validation layer (`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`, messages land in
   `logs/NAME.stdout`): 3 workers + chaos gives the same messages as 0 workers (a fence used on two
   threads, one render pass format mismatch, an acquire timeout: all there before), none new.
+- S23 FE: `tools/android/walk_squares.sh mt_sq --ab 'gtav_native_record_workers=0|2'` (40 s walk,
+  a frame captured every second): 0 wrongly lit tiles in 8 frames without workers and 0 in 7 with
+  them; frames from both sides looked over by eye (whole picture, HUD, phone overlay).
 - No crash in any run on Linux or the phone.
 
 ## Does it help?
