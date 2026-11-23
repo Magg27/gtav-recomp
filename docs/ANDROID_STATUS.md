@@ -72,6 +72,28 @@ Measured and left off / removed:
 - Vblank thread slowed when vsync is off, skipping wakes of idle waiters, the prime core for the
   main thread alone: no difference. Removed (the last one stays as a cvar, off).
 
+- Codegen option `non_volatile_as_local` (the game's r14-r31 and friends as C++ locals instead of
+  context fields): the 11-21 boot failure is solved in the SDK's code generator (details in
+  `docs/LINUX_PERF_2026-11-12.md`). Game library cross-built both ways and swapped on the phone,
+  four alternating runs with cooling waits, CPU time of all game threads a frame: 155.9 ms at
+  2,508 draws and 135.8 at 1,902 without, 151.9 at 2,467 and 145.8 at 2,371 with: 2-4% less at
+  equal draws, fps inside the run-to-run spread, no crash in eight runs. Left off: it rewrites
+  every game function on every platform for a gain that small, and indirect calls into fragments,
+  setjmp and long play are untested. `tools/native/nv_local_manifest.patch` turns it on.
+  (Two libraries cannot be flipped inside one run, so this comparison is between boots: the scene
+  differs by several hundred draws from boot to boot, which is why it needs the per-frame CPU
+  figure and cannot resolve less than about 3%.)
+
+What is left, in order of what it could give (none of it is a quick switch):
+- The phone runs at about half its clock when warm (1.2-1.45 of 2.5-3.0 GHz, GPU 285-490 of
+  818 MHz). A run started at 27 C battery gave 41-44 fps at 2,000-2,750 draws; started at 36 C
+  the same draw counts give 25-31. A cooler phone (not charging while playing, out of its case)
+  is worth more than any item below.
+- The game's audio mixer thread: 65-75% of a middle core, its own mixing code plus XMA decoding.
+- The record thread's per-frame hashing of vertex data (6% of it) and the Adreno driver's share
+  (about 18%): only matter once the game stops setting the frame.
+- Fewer draws (shadow cascades, tiled lights): a picture trade-off, the owner's call.
+
 The rect-list geometry shader on Adreno 730, second look: DXC's SPIR-V still asserts in the
 driver's compiler in every form. The same shader written in GLSL and built with the NDK's glslc
 compiles, and then the tiled lighting's rects come out sheared/black, in six forms (select,

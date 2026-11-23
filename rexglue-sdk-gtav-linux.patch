@@ -1769,10 +1769,21 @@ index 33ac6d0..0157c42 100644
    /**
     * @brief Get expression for general-purpose register access.
 diff --git a/src/codegen/builders/context.cpp b/src/codegen/builders/context.cpp
-index f78e0d8..c29716b 100644
+index f78e0d8..802a32c 100644
 --- a/src/codegen/builders/context.cpp
 +++ b/src/codegen/builders/context.cpp
-@@ -79,16 +79,48 @@ std::string BuilderContext::v(size_t index) {
+@@ -44,7 +44,10 @@ const FunctionGraph& BuilderContext::graph() const {
+ 
+ // Localizing a non-volatile assumes the function owns it across its whole body.
+ // An SEH funclet does not: it inherits its owner's live registers through ctx.
++// The __save*/__rest* helpers work on their caller's registers by definition: ctx, always.
+ bool BuilderContext::localizeNonVolatiles() const {
++  const auto& self = fn.name();
++  if (self.find("__rest") == 0 || self.find("__save") == 0) return false;
+   return config().nonVolatileRegistersAsLocalVariables && !fn.sharesRegisters();
+ }
+ 
+@@ -79,16 +82,48 @@ std::string BuilderContext::v(size_t index) {
    return fmt::format("ctx.v{}", index);
  }
  
@@ -1823,7 +1834,7 @@ index f78e0d8..c29716b 100644
      locals.ctr = true;
      return "ctr";
    }
-@@ -96,7 +128,7 @@ const char* BuilderContext::ctr() {
+@@ -96,7 +131,7 @@ const char* BuilderContext::ctr() {
  }
  
  const char* BuilderContext::xer() {
@@ -1832,7 +1843,26 @@ index f78e0d8..c29716b 100644
      locals.xer = true;
      return "xer";
    }
-@@ -213,16 +245,17 @@ void BuilderContext::emit_function_call(uint32_t address) {
+@@ -198,11 +233,13 @@ void BuilderContext::emit_function_call(uint32_t address) {
+       auto* targetFn = target->asFunction();
+       const auto& name = targetFn->name();
+ 
+-      // Handle save/restore helpers. Gated on the global setting, not this
+-      // function's: the helper bodies are emitted under it too, so once they
+-      // spill to locals they are no-ops that scribble zeros on the caller's
+-      // frame. A share_registers function still has to elide them.
+-      if (cfg.nonVolatileRegistersAsLocalVariables &&
++      // Save/restore helpers: a function that keeps its non-volatiles as locals has nothing to
++      // save. A share_registers function keeps the calls (and the helper bodies stay on ctx):
++      // many of them are ordinary functions that only got the mark for a harmless early read,
++      // and without their saves the registers they use as scratch came back to the caller's
++      // locals through the handover (GTA V: sub_832C0160 handed sub_832CEF70 a wrong r30, the
++      // address the D3D device is stored at, and the device global stayed 0).
++      if (localizeNonVolatiles() &&
+           (name.find("__rest") == 0 || name.find("__save") == 0)) {
+         // print nothing - these are handled by local variable tracking
+         return;
+@@ -213,16 +250,17 @@ void BuilderContext::emit_function_call(uint32_t address) {
        // them back afterwards. Only registers already localized here can be live at
        // this point, so that set is the whole live-in the funclet can see.
        if (targetFn->sharesRegisters() && localizeNonVolatiles()) {
@@ -1859,7 +1889,7 @@ index f78e0d8..c29716b 100644
          return;
        }
  
-@@ -298,7 +331,15 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
+@@ -298,7 +336,15 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
            auto* targetFn = callTarget->asFunction();
            emitCtx.reference(targetFn->name());
            println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
