@@ -507,6 +507,87 @@ index e90418d..9f5d0f8 100644
  #ifndef REX_PLATFORM_WIN32
  #define REX_PLATFORM_WIN32 0
  #endif
+diff --git a/include/rex/ppc/context.h b/include/rex/ppc/context.h
+index 0ede542..35a60c3 100644
+--- a/include/rex/ppc/context.h
++++ b/include/rex/ppc/context.h
+@@ -177,6 +177,26 @@ struct FPSCRRegister {
+     setcsr(csr);
+   }
+ 
++  // The host's denormal mode, set for real in every build (thread start).
++  inline void setFlushMode(bool on) noexcept {
++    csr = on ? (csr | FlushMask) : (csr & ~FlushMask);
++    setcsr(csr);
++  }
++
++  // REX_FP_SINGLE_MODE (max-performance builds): generated code does not switch the host's
++  // denormal mode between scalar FPU instructions (denormals kept) and VMX ones (flushed to
++  // zero). The thread stays in the mode it starts in: denormals kept, unless
++  // --guest_fp_always_flush. Kept is the exact one for scalar code: lfs/stfs are float<->double
++  // conversions here, and under flush-to-zero a small integer copied through a float register
++  // (a denormal bit pattern) would turn into 0. What differs from the console is VMX arithmetic
++  // on values below 1.2e-38, which the console flushes to zero. Saves a test and branch per FP
++  // instruction group and the FPCR/MXCSR writes.
++#if defined(REX_FP_SINGLE_MODE)
++  inline void enableFlushMode() noexcept {}
++  inline void disableFlushMode() noexcept {}
++  inline void enableFlushModeUnconditional() noexcept {}
++  inline void disableFlushModeUnconditional() noexcept {}
++#else
+   inline void enableFlushModeUnconditional() noexcept {
+     csr |= FlushMask;
+     setcsr(csr);
+@@ -200,6 +220,7 @@ struct FPSCRRegister {
+       setcsr(csr);
+     }
+   }
++#endif
+ 
+   inline void InitHost() noexcept {
+     csr = getcsr();
+diff --git a/include/rex/ppc/intrinsics.h b/include/rex/ppc/intrinsics.h
+index 3c2fe09..5009c3f 100644
+--- a/include/rex/ppc/intrinsics.h
++++ b/include/rex/ppc/intrinsics.h
+@@ -36,7 +36,9 @@ namespace rex::ppc {
+ // These tables are used for lvlx/lvrx (load vector left/right) and
+ // stvlx/stvrx (store vector left/right) instructions.
+ 
+-inline uint8_t VectorMaskL[] = {
++// constexpr: the compiler then keeps a byte-swap mask in a register for a whole function
++// instead of reloading it from memory (and re-masking it on arm64) at every vector load/store.
++alignas(16) inline constexpr uint8_t VectorMaskL[] = {
+     0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00,
+     0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+     0xFF, 0xFF, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02,
+@@ -55,7 +57,7 @@ inline uint8_t VectorMaskL[] = {
+     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F,
+ };
+ 
+-inline uint8_t VectorMaskR[] = {
++alignas(16) inline constexpr uint8_t VectorMaskR[] = {
+     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+     0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+     0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+@@ -74,7 +76,7 @@ inline uint8_t VectorMaskR[] = {
+     0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0xFF,
+ };
+ 
+-inline uint8_t VectorShiftTableL[] = {
++alignas(16) inline constexpr uint8_t VectorShiftTableL[] = {
+     0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00,
+     0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+     0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02,
+@@ -93,7 +95,7 @@ inline uint8_t VectorShiftTableL[] = {
+     0x1E, 0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F,
+ };
+ 
+-inline uint8_t VectorShiftTableR[] = {
++alignas(16) inline constexpr uint8_t VectorShiftTableR[] = {
+     0x1F, 0x1E, 0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10,
+     0x1E, 0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F,
+     0x1D, 0x1C, 0x1B, 0x1A, 0x19, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x10, 0x0F, 0x0E,
 diff --git a/include/rex/system/xobject.h b/include/rex/system/xobject.h
 index 0a43f07..ea9bb29 100644
 --- a/include/rex/system/xobject.h
@@ -1756,23 +1837,27 @@ index a0a178d..f384876 100644
        }
      }
 diff --git a/src/codegen/builders/builder_context.h b/src/codegen/builders/builder_context.h
-index 33ac6d0..0157c42 100644
+index 33ac6d0..9d7d98e 100644
 --- a/src/codegen/builders/builder_context.h
 +++ b/src/codegen/builders/builder_context.h
-@@ -113,6 +113,8 @@ struct BuilderContext {
+@@ -113,6 +113,12 @@ struct BuilderContext {
     * False when the function shares registers with an intra-function bl partner.
     */
    bool localizeNonVolatiles() const;
++  bool localizeNonArguments() const;
++  // Placeholder lines in a function body, replaced when the body is complete.
++  static constexpr const char* kSyncToCtx = "/*@REX_SYNC_TO_CTX@*/";
++  static constexpr const char* kSyncFromCtx = "/*@REX_SYNC_FROM_CTX@*/";
 +  void syncNonVolatiles(bool to_ctx, const char* indent);
 +  void restoreNonVolatiles(const char* indent);
  
    /**
     * @brief Get expression for general-purpose register access.
 diff --git a/src/codegen/builders/context.cpp b/src/codegen/builders/context.cpp
-index f78e0d8..802a32c 100644
+index f78e0d8..0935783 100644
 --- a/src/codegen/builders/context.cpp
 +++ b/src/codegen/builders/context.cpp
-@@ -44,7 +44,10 @@ const FunctionGraph& BuilderContext::graph() const {
+@@ -44,13 +44,24 @@ const FunctionGraph& BuilderContext::graph() const {
  
  // Localizing a non-volatile assumes the function owns it across its whole body.
  // An SEH funclet does not: it inherits its owner's live registers through ctx.
@@ -1783,7 +1868,43 @@ index f78e0d8..802a32c 100644
    return config().nonVolatileRegistersAsLocalVariables && !fn.sharesRegisters();
  }
  
-@@ -79,16 +82,48 @@ std::string BuilderContext::v(size_t index) {
++// r0, r2, r11, r12, f0 and v32-v63 as locals: not in a share_registers function (a fragment
++// continues with its parent's r11/r12, an SEH funclet gets its frame in r12) and not in the
++// __save*/__rest* helpers (r12 is their base pointer). Their callers hand them over through ctx.
++bool BuilderContext::localizeNonArguments() const {
++  const auto& self = fn.name();
++  if (self.find("__rest") == 0 || self.find("__save") == 0) return false;
++  return config().nonArgumentRegistersAsLocalVariables && !fn.sharesRegisters();
++}
++
+ std::string BuilderContext::r(size_t index) {
+-  const auto& cfg = config();
+-  if ((cfg.nonArgumentRegistersAsLocalVariables &&
++  if ((localizeNonArguments() &&
+        (index == 0 || index == 2 || index == 11 || index == 12)) ||
+       (localizeNonVolatiles() && index >= 14)) {
+     locals.r[index] = true;
+@@ -60,8 +71,7 @@ std::string BuilderContext::r(size_t index) {
+ }
+ 
+ std::string BuilderContext::f(size_t index) {
+-  const auto& cfg = config();
+-  if ((cfg.nonArgumentRegistersAsLocalVariables && index == 0) ||
++  if ((localizeNonArguments() && index == 0) ||
+       (localizeNonVolatiles() && index >= 14)) {
+     locals.f[index] = true;
+     return fmt::format("f{}", index);
+@@ -70,8 +80,7 @@ std::string BuilderContext::f(size_t index) {
+ }
+ 
+ std::string BuilderContext::v(size_t index) {
+-  const auto& cfg = config();
+-  if ((cfg.nonArgumentRegistersAsLocalVariables && (index >= 32 && index <= 63)) ||
++  if ((localizeNonArguments() && (index >= 32 && index <= 63)) ||
+       (localizeNonVolatiles() && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127)))) {
+     locals.v[index] = true;
+     return fmt::format("v{}", index);
+@@ -79,16 +88,45 @@ std::string BuilderContext::v(size_t index) {
    return fmt::format("ctx.v{}", index);
  }
  
@@ -1817,15 +1938,12 @@ index f78e0d8..802a32c 100644
 +  // emitted after it (an unseen one becomes a zero-initialised local; these calls are rare).
 +  for (size_t i = 14; i < 32; ++i) { locals.r[i] = true; one("r", i); }
 +  for (size_t i = 14; i < 32; ++i) { locals.f[i] = true; one("f", i); }
-+  for (size_t i = 14; i < 128; ++i) if (locals.v[i] && (i < 32 || i >= 64)) one("v", i);
-+  // ... and the condition register fields, CTR and XER when those are locals here.
-+  for (size_t i = 0; i < 8; ++i) if (locals.cr[i]) one("cr", i);
-+  if (locals.ctr) {
-+    if (to_ctx) println("{}ctx.ctr = ctr;", indent); else println("{}ctr = ctx.ctr;", indent);
-+  }
-+  if (locals.xer) {
-+    if (to_ctx) println("{}ctx.xer = xer;", indent); else println("{}xer = ctx.xer;", indent);
-+  }
++  // ... and every other local of this function: vectors, the non-argument registers (r0, r2,
++  // r11, r12, f0, v32-v63), the condition register fields, CTR and XER. Which of those it has
++  // is only known once the whole body is generated (the same backward-branch reason), so this
++  // line is filled in then (FunctionGraph, kSyncToCtx / kSyncFromCtx). Only the ones the function
++  // uses: an unused volatile register may be one a caller keeps live in ctx across this function.
++  println("{}{}", indent, to_ctx ? kSyncToCtx : kSyncFromCtx);
 +}
 +
  const char* BuilderContext::ctr() {
@@ -1834,7 +1952,7 @@ index f78e0d8..802a32c 100644
      locals.ctr = true;
      return "ctr";
    }
-@@ -96,7 +131,7 @@ const char* BuilderContext::ctr() {
+@@ -96,7 +134,7 @@ const char* BuilderContext::ctr() {
  }
  
  const char* BuilderContext::xer() {
@@ -1843,7 +1961,7 @@ index f78e0d8..802a32c 100644
      locals.xer = true;
      return "xer";
    }
-@@ -198,11 +233,13 @@ void BuilderContext::emit_function_call(uint32_t address) {
+@@ -198,11 +236,13 @@ void BuilderContext::emit_function_call(uint32_t address) {
        auto* targetFn = target->asFunction();
        const auto& name = targetFn->name();
  
@@ -1862,7 +1980,7 @@ index f78e0d8..802a32c 100644
            (name.find("__rest") == 0 || name.find("__save") == 0)) {
          // print nothing - these are handled by local variable tracking
          return;
-@@ -213,16 +250,17 @@ void BuilderContext::emit_function_call(uint32_t address) {
+@@ -213,16 +253,17 @@ void BuilderContext::emit_function_call(uint32_t address) {
        // them back afterwards. Only registers already localized here can be live at
        // this point, so that set is the whole live-in the funclet can see.
        if (targetFn->sharesRegisters() && localizeNonVolatiles()) {
@@ -1889,7 +2007,7 @@ index f78e0d8..802a32c 100644
          return;
        }
  
-@@ -298,7 +336,15 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
+@@ -298,7 +339,15 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
            auto* targetFn = callTarget->asFunction();
            emitCtx.reference(targetFn->name());
            println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
@@ -1996,6 +2114,53 @@ index cbdd7f7..6b9067c 100644
    ctx.println("\t}}");
    return true;
  }
+diff --git a/src/codegen/function_graph.cpp b/src/codegen/function_graph.cpp
+index fc918bb..83f995c 100644
+--- a/src/codegen/function_graph.cpp
++++ b/src/codegen/function_graph.cpp
+@@ -15,6 +15,7 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <cstring>
+ #include <unordered_set>
+ 
+ #include <fmt/format.h>
+@@ -637,6 +638,34 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+     emit_println(body, "}}\n");
+   }
+ 
++  // --- Register handover lines (BuilderContext::syncNonVolatiles): the locals this function has
++  // besides r14-r31 / f14-f31, now that all of them are known. ---
++  if (body.find(BuilderContext::kSyncToCtx) != std::string::npos ||
++      body.find(BuilderContext::kSyncFromCtx) != std::string::npos) {
++    std::string to, from;
++    auto one = [&](const std::string& name) {
++      to += fmt::format("ctx.{0} = {0}; ", name);
++      from += fmt::format("{0} = ctx.{0}; ", name);
++    };
++    for (size_t i = 0; i < 14; ++i)
++      if (localVariables.r[i]) one(fmt::format("r{}", i));
++    for (size_t i = 0; i < 14; ++i)
++      if (localVariables.f[i]) one(fmt::format("f{}", i));
++    for (size_t i = 0; i < 128; ++i)
++      if (localVariables.v[i]) one(fmt::format("v{}", i));
++    for (size_t i = 0; i < 8; ++i)
++      if (localVariables.cr[i]) one(fmt::format("cr{}", i));
++    if (localVariables.ctr) one("ctr");
++    if (localVariables.xer) one("xer");
++    auto replaceAll = [&](const char* token, const std::string& with) {
++      const size_t n = std::strlen(token);
++      for (size_t at = body.find(token); at != std::string::npos; at = body.find(token, at + with.size()))
++        body.replace(at, n, with);
++    };
++    replaceAll(BuilderContext::kSyncToCtx, to);
++    replaceAll(BuilderContext::kSyncFromCtx, from);
++  }
++
+   // --- Emit local variable declarations, then body ---
+   if (localVariables.ctr)
+     emit_println(out, "\tPPCRegister ctr{{}};");
 diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
 index 1ddafd0..055910f 100644
 --- a/src/core/CMakeLists.txt
@@ -4465,6 +4630,28 @@ index 1fda053..7c65432 100644
    return X_STATUS_SUCCESS;
  }
  
+diff --git a/src/system/function_dispatcher.cpp b/src/system/function_dispatcher.cpp
+index bd43109..db721f1 100644
+--- a/src/system/function_dispatcher.cpp
++++ b/src/system/function_dispatcher.cpp
+@@ -286,13 +286,11 @@ uint32_t FunctionDispatcher::AllocateThunk(::PPCFunc* func, uint32_t caller_addr
+   std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
+   auto* mod = FindModuleByAddress(caller_address);
+   if (!mod) {
+-    if (caller_address != 0) {
+-      REXLOG_ERROR("AllocateThunk: caller_address {:08X} not in any registered module",
+-                   caller_address);
+-      return 0;
+-    }
++    // No usable caller address (0, or a stale LR: game code generated with skip_lr never
++    // updates it): the thunk goes to the executable's module.
+     if (entrypoint_code_base_ == 0) {
+-      REXLOG_ERROR("AllocateThunk: caller_address=0 but no entrypoint registered");
++      REXLOG_ERROR("AllocateThunk: caller_address {:08X} in no module and no entrypoint registered",
++                   caller_address);
+       return 0;
+     }
+     mod = FindModuleByAddress(entrypoint_code_base_);
 diff --git a/src/system/gpu_plugin_loader.cpp b/src/system/gpu_plugin_loader.cpp
 index 754fa13..b1006d6 100644
 --- a/src/system/gpu_plugin_loader.cpp
@@ -4801,10 +4988,10 @@ index db830e4..f053f2a 100644
    bool success = semaphore_->Release(release_count, &previous_count);
    if (out_previous_count) {
 diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
-index 77bce25..53be837 100644
+index 77bce25..bb7c663 100644
 --- a/src/system/xthread.cpp
 +++ b/src/system/xthread.cpp
-@@ -37,6 +37,13 @@
+@@ -37,6 +37,21 @@
  #include <rex/thread.h>
  #include <rex/vec128.h>
  
@@ -4813,12 +5000,20 @@ index 77bce25..53be837 100644
 +// instead. S23 FE same-run A/B 11-22, 0 vs 50: 20.5/18.1 vs 19.4/17.8 fps: yield there too.
 +// (Also tried there: 16 yields in a row, then 50 us sleeps, so that the main thread's poll for its
 +// job threads' output frees the prime core: 1-4% slower. The poll is the fastest way to notice.)
++// Game code built with REX_FP_SINGLE_MODE never switches the denormal mode itself; its threads
++// stay in the mode they start in. Default: denormals kept (the scalar FPU's mode; exact for scalar
++// code and for raw bit patterns copied through float registers). true: flushed to zero (VMX's mode
++// on the console; rules out slow denormal arithmetic on x86, but lfs/stfs then zero denormal bit
++// patterns). Game code built without the define sets the mode before every FP instruction group,
++// so this setting changes nothing there.
++REXCVAR_DEFINE_BOOL(guest_fp_always_flush, false, "Kernel",
++                    "Guest threads start with denormals flushed to zero (single-FP-mode game builds stay in it)");
 +REXCVAR_DEFINE_INT32(guest_sleep_zero_us, 0, "Kernel",
 +                     "Guest Sleep(0): 0 = yield the core, N = sleep N microseconds (live)");
  REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
                      "Ignores game-specified thread priorities");
  
-@@ -183,6 +190,18 @@ void XThread::set_name(const std::string_view name) {
+@@ -183,6 +198,18 @@ void XThread::set_name(const std::string_view name) {
    }
  }
  
@@ -4837,7 +5032,7 @@ index 77bce25..53be837 100644
  static uint8_t next_cpu = 0;
  static uint8_t GetFakeCpuNumber(uint8_t proc_mask) {
    // NOTE: proc_mask is logical processors, not physical processors or cores.
-@@ -441,6 +460,7 @@ X_STATUS XThread::Create() {
+@@ -441,6 +468,7 @@ X_STATUS XThread::Create() {
  
      // Set name immediately, if we have one.
      thread_->set_name(thread_name_);
@@ -4845,7 +5040,7 @@ index 77bce25..53be837 100644
  
      PROFILE_THREAD_ENTER(thread_name_.c_str());
      PROFILE_THREAD_CREATED();
-@@ -470,7 +490,9 @@ X_STATUS XThread::Create() {
+@@ -470,7 +498,9 @@ X_STATUS XThread::Create() {
      set_name(fmt::format("XThread{:04X}", thread_->system_id()));
    }
  
@@ -4856,7 +5051,15 @@ index 77bce25..53be837 100644
      thread_->set_priority(creation_params_.creation_flags & 0x20 ? 1 : 0);
    }
  
-@@ -856,6 +878,7 @@ void XThread::SetPriority(int32_t increment) {
+@@ -637,6 +667,7 @@ void XThread::Execute() {
+     ctx->r10.u64 = args[7];
+ 
+   ctx->fpscr.InitHost();
++  if (REXCVAR_GET(guest_fp_always_flush)) ctx->fpscr.setFlushMode(true);
+ 
+   // Convert this host thread to a fiber so SwitchTo works bidirectionally.
+   // Required on Windows before any CreateFiber; provides the fallback handle
+@@ -856,6 +887,7 @@ void XThread::SetPriority(int32_t increment) {
    if (!REXCVAR_GET(ignore_thread_priorities)) {
      thread_->set_priority(target_priority);
    }
@@ -4864,7 +5067,7 @@ index 77bce25..53be837 100644
  }
  
  void XThread::SetAffinity(uint32_t affinity) {
-@@ -901,6 +924,7 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
+@@ -901,6 +933,7 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
    } else {
      REXSYS_WARN("Too few processor cores - scheduling will be wonky");
    }
@@ -4872,7 +5075,7 @@ index 77bce25..53be837 100644
  }
  
  bool XThread::GetTLSValue(uint32_t slot, uint32_t* value_out) {
-@@ -1025,8 +1049,16 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
+@@ -1025,8 +1058,16 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
      }
    } else {
      if (timeout_ms == 0) {

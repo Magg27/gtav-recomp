@@ -19,6 +19,15 @@ function. The generated code is read as it is without the option (registers as c
 --roots: only functions that read a register themselves (calls not followed).
 --writes: instead, functions that write a non-volatile they never save (a value handed back to
 the caller: live-out), again only the ones not marked yet with --known.
+--nonarg: the same questions for non_argument_as_local's set (r0, r2, r11, r12, f0, v32-v63).
+These are volatile, so nothing is "saved": a stack store counts as a read. What it finds are
+fragments that continue with their parent's r11/r12 and SEH funclets that get the frame in r12;
+vector hits are mostly `vrlimi128 vD,vS,7,0`-style merges with an undefined source, harmless.
+--after-calls (with --nonarg): registers read after a call before being rewritten, i.e. values a
+callee hands back. Kept only when the callee writes the register itself or through its direct
+calls, or the call is indirect (the program is whole-program optimised: a caller keeps r11 or f0
+live across a callee it knows does not touch them, which works with locals). Value-independent
+idioms (`subfe rD,rX,rX`, `xor rD,rX,rX`, ...) are not reads. Prints "callee reg:n | from callers".
 Prints "name reg reg ..." for every function with a register live at entry; with --known, only
 the ones the manifest does not mark share_registers yet (and how many it already has)."""
 import glob
@@ -39,6 +48,11 @@ if "--known" in sys.argv:
             known.add("sub_%08X" % int(m.group(1), 16))
 
 NV = r"(?:r(?:1[4-9]|2[0-9]|3[01])|f(?:1[4-9]|2[0-9]|3[01])|v(?:1[4-9]|2[0-9]|3[01]|6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7]))"
+# --nonarg: the same questions for non_argument_as_local's set instead (r0, r2, r11, r12, f0,
+# v32-v63). Nothing saves these, so a store to the stack is a read like any other.
+NONARG = "--nonarg" in sys.argv
+if NONARG:
+    NV = r"(?:r(?:0|2|11|12)|f0|v(?:3[2-9]|[45][0-9]|6[0-3]))"
 MENTION = re.compile(r"\bctx\.(" + NV + r")\b")
 ASSIGN = re.compile(r"^ctx\.(" + NV + r")\.\w+(?:\[\d+\])?\s*=[^=]")
 VSTORE = re.compile(r"^simde_mm_store\w*\(\s*(?:\([^)]*\)\s*)?ctx\.(" + NV + r")\.\w+\s*,")
@@ -51,6 +65,8 @@ REG = re.compile(r"\bctx\.(r\d+)\b")
 LABEL = re.compile(r"^(loc_[0-9A-Fa-f]+):")
 GOTO = re.compile(r"\bgoto (loc_[0-9A-Fa-f]+);")
 CALL = re.compile(r"\b((?:sub_[0-9A-Fa-f]{8})|__(?:save|rest)\w+)\(ctx, base\);")
+SAME = re.compile(r"// (?:subfe|subf|xor|andc|eqv|vxor|vxor128|vandc|vandc128|vcmpequb|vcmpequh|vcmpequw|vcmpequw128|vsubuwm|vsububm|vsubuhm) \w+,(\w+),(\w+)$")
+INDIRECT = re.compile(r"\bREX_CALL_INDIRECT_FUNC\(")
 
 
 HELPER = re.compile(r"^__(?:save|rest)(gprlr|fpr|vmx)_(\d+)$")
@@ -90,6 +106,7 @@ def parse(path, funcs):
             funcs[fn] = (blocks, labels)
             sv = saved[fn] = set()
             wr = written[fn] = set()
+            same = None
             continue
         if fn is None:
             continue
@@ -98,8 +115,16 @@ def parse(path, funcs):
             continue
         depth = len(raw) - len(raw.lstrip("\t"))
         s = raw.strip()
-        if not s or s.startswith("//"):
+        if s.startswith("// "):
+            # "subfe rD,rX,rX", "xor rD,rX,rX", "vxor vD,vX,vX"...: the result does not depend on
+            # rX, and compilers use whatever register is at hand: not a read of its value.
+            m = SAME.match(s)
+            same = m.group(1) if m and m.group(1) == m.group(2) else None
             continue
+        if not s:
+            continue
+        if same:
+            s = s.replace("ctx." + same + ".", "ctx.same_.").replace("ctx." + same + ")", "ctx.same_)")
         m = LABEL.match(s)
         if m:
             labels[m.group(1)] = len(blocks)
@@ -121,7 +146,7 @@ def parse(path, funcs):
         if m and m.group(1) != "r1":
             from_sp = any(r == "r1" or r in sp for r in REG.findall(m.group(2))) and "REX_LOAD" not in m.group(2)
             (sp.add if from_sp else sp.discard)(m.group(1))
-        if save:
+        if save and not NONARG:
             sv.update(MENTION.findall(s))
         else:
             d = ASSIGN.match(s) or VSTORE.match(s) or WHOLE.match(s)
@@ -135,15 +160,23 @@ def parse(path, funcs):
         c = CALL.search(s)
         if c and not c.group(1).startswith("__"):
             b.events.append(("c", c.group(1)))
-        elif c and c.group(1).startswith("__save"):
+        elif c and c.group(1).startswith("__save") and not NONARG:
             sv.update(helper_regs(c.group(1)))
+        if s.startswith("__builtin_trap()"):  # the end of a jump table: nothing falls out of it
+            b.falls = False
+            blocks.append(Block())
+            continue
+        if INDIRECT.search(s):
+            b.events.append(("c", "(indirect)"))
         g = GOTO.search(s)
         conditional = depth > 1 or s.startswith("if ") or s.startswith("case ") or s.startswith("default")
         if g:
             b.succ.append(g.group(1))
             if not conditional:
                 b.falls = False
-                blocks.append(Block())  # (unreachable until a label; keeps the indices simple)
+            # A new block after every branch, taken or not: code after a conditional branch must
+            # not inherit what is live at the branch target.
+            blocks.append(Block())
         elif s == "return;" and not conditional:
             b.falls = False
             blocks.append(Block())
@@ -195,6 +228,10 @@ def analyse(name):
     return frozenset(live[0] if KEEP_SAVED else live[0] - saved[name])
 
 
+def order(r):
+    return (r[0], int(r[1:]))
+
+
 callers = {}
 for name, (blocks, _) in funcs.items():
     for b in blocks:
@@ -214,14 +251,81 @@ while work:
             nxt |= callers.get(name, set())
     work = nxt
 
+if "--after-calls" in sys.argv:
+    # Registers read after a call before the function writes them again: values the callee hands
+    # back. Per callee, the registers and how many call sites.
+    back = {}
+    for name, (blocks, labels) in funcs.items():
+        n = len(blocks)
+        use, define = [], []
+        for b in blocks:
+            u, d = set(), set()
+            for kind, x in b.events:
+                if kind == "u":
+                    if x not in d:
+                        u.add(x)
+                elif kind == "d":
+                    d.add(x)
+            use.append(u)
+            define.append(d)
+        succ = []
+        for i, b in enumerate(blocks):
+            t = [labels[x] for x in b.succ if x in labels]
+            if b.falls and i + 1 < n:
+                t.append(i + 1)
+            succ.append(t)
+        live = [set(u) for u in use]
+        changed = True
+        while changed:
+            changed = False
+            for i in range(n - 1, -1, -1):
+                out = set()
+                for t in succ[i]:
+                    out |= live[t]
+                new = use[i] | (out - define[i])
+                if new != live[i]:
+                    live[i] = new
+                    changed = True
+        for i, b in enumerate(blocks):
+            cur = set()
+            for t in succ[i]:
+                cur |= live[t]
+            for kind, x in reversed(b.events):
+                if kind == "u":
+                    cur.add(x)
+                elif kind == "d":
+                    cur.discard(x)
+                elif cur:
+                    e = back.setdefault(x, {})
+                    for r in cur:
+                        e.setdefault(r, set()).add(name)
+    # A register can stay live across a call the compiler knows not to touch it (whole-program
+    # builds do that for volatile registers): that works with locals too. Only a callee that
+    # writes the register, itself or through its own direct calls, hands a value back.
+    wstar = {n: set(w) for n, w in written.items()}
+    calls = {n: {x for b in blocks for k, x in b.events if k == "c"} for n, (blocks, _) in funcs.items()}
+    changed = True
+    while changed:
+        changed = False
+        for n, cs in calls.items():
+            w = wstar[n]
+            before = len(w)
+            for c in cs:
+                w |= wstar.get(c, set())
+            if len(w) != before:
+                changed = True
+    for callee in sorted(back):
+        regs = {r: v for r, v in back[callee].items() if callee == "(indirect)" or r in wstar.get(callee, ())}
+        if regs:
+            print(callee, " ".join(f"{r}:{len(v)}" for r, v in sorted(regs.items(), key=lambda kv: order(kv[0]))),
+                  "| from", " ".join(sorted(set().union(*regs.values()))[:6]))
+    sys.exit(0)
+
 if WRITES:
     livein = {n: frozenset(written[n] - saved[n]) for n in funcs}
 hits = {n: v for n, v in livein.items() if v and not n.startswith("__")}
 new = {n: v for n, v in hits.items() if n not in known}
 
-
-def order(r):
-    return (r[0], int(r[1:]))
 
 
 print(f"# {len(funcs)} functions, {len(hits)} with a non-volatile {'written but never saved' if WRITES else 'live at entry'} ({rounds} rounds)"

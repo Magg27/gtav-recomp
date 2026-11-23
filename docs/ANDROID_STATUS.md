@@ -11,6 +11,89 @@ GTA V runs in-game on a Galaxy S23 FE (Snapdragon 8 Gen 1, Adreno 730, Android 1
 letterboxed, with on-screen touch controls (a Bluetooth pad hides them). About 10-15 fps while the
 GPU is thermally throttled (350 of 818 MHz after long sessions on the charger).
 
+## Max-performance line 11-23 (branch `max-perf`, off `android-cpu`; Linux and Android only)
+
+Owner: "keep on working on a max performance version that is solely focused on getting it to run
+as fast as possible on Linux and Android". This branch turns on what the cross-platform line left
+off. It rewrites every recompiled function, and nothing here was built or run on Windows, macOS or
+iOS (they share the manifest): do not merge it into the release line without those tests.
+
+What is on, all of it in the game's own recompiled code:
+- Manifest `[entrypoint]`: `non_volatile_as_local` (r14-r31, f14-f31, v14-v31/v64-v127 as C++
+  locals), `non_argument_as_local` (r0, r2, r11, r12, f0, v32-v63: 24% of all register mentions in
+  the generated code, r11 alone 16%), `skip_lr` (no link-register store before every call: 5%).
+  66 `share_registers` functions: the 64 from the nv work plus `sub_83452B24` (a fragment that
+  continues with its parent's r11) and `sub_83779360` (a funclet that gets its frame in r12).
+- SDK code generator (`rexglue-sdk-gtav-linux.patch`): `non_argument_as_local` could not work with
+  fragments. Now share_registers functions and the `__save*/__rest*` helpers keep those registers
+  in the context, and a caller hands over every local it uses (a placeholder in the call site,
+  filled in once the whole body is generated: `function_graph.cpp`). `tools/native/nv_cfg.py
+  --nonarg [--after-calls]` is the liveness check that found the two functions; its other hits
+  were value-independent idioms (`subfe rD,rX,rX`) or code after calls that never return. With the
+  options off the generator's output is byte-identical to before (767 files compared).
+- `skip_lr`: the game has no `blrl` and never reads LR as data. The one kernel call that used it
+  (`XexGetProcedureAddress`, to pick the caller's module for a thunk) now falls back to the
+  executable's module (`function_dispatcher.cpp`). Guest stack frames hold no valid return
+  addresses any more: crash reports cannot walk the guest stack on this branch.
+- Byte-swap masks are constants: `VectorMaskL/R` and `VectorShiftTableL/R` were `inline uint8_t[]`
+  (writable), so every vector load and store fetched its mask through the GOT and, on arm64,
+  masked it again. `alignas(16) inline constexpr` in `gtav/fs/gtav_pch.h` and the SDK's
+  `intrinsics.h`. Same results.
+- One floating-point mode (`-DREX_FP_SINGLE_MODE` for the Linux and Android game code:
+  `loader/src/install.cpp`, `tools/game_dll/build_game_dll.py`, CMake `GTAV_FP_SINGLE_MODE`). The
+  generated code tested the host's denormal mode before every group of FP instructions (133,000
+  sites) and wrote FPCR/MXCSR at 16,400 of them unconditionally. Threads now stay in the mode they
+  start in, denormals kept. That is the exact one for scalar code; flush-to-zero would not be,
+  because `lfs`/`stfs` are float<->double conversions here and would turn a small integer copied
+  through a float register into 0. What differs from the console is VMX arithmetic on values
+  below 1.2e-38 (the console flushes those to zero). `--guest_fp_always_flush=true` starts threads
+  flushed instead, for experiments.
+- `tools/release/expected.txt`: the 811 `gen` lines are the generated code of this manifest
+  (installer-style run with the shipped partition seed), so the on-phone build passes its check.
+
+The four hottest functions, arm64 instructions: audio mix loop `sub_831B5F98` 90 -> 61,
+`sub_83210BD0` 540 -> 402, the main thread's `sub_83525E00` 3,164 -> 2,680, the job threads'
+`sub_83594868` 1,246 -> 853. Game library 91.9 -> 66.7 MB.
+
+Phone (S23 FE), the phone's own library (A, `android-cpu` code) against the max-perf library (B,
+cross-built with `tools/game_dll/build_game_dll.py --android`), alternating boots from the same
+battery temperature, 150 s warm-up, 40 s window, muted (`tools/android/lib_ab.sh`, new: it also
+counts user-mode instructions and cycles per thread with simpleperf, which do not depend on the
+heat caps):
+
+| run | fps | draws | game threads M cycles / frame | job threads M instr / frame | caps mid / prime GHz | GPU idle ms / frame |
+|---|---|---|---|---|---|---|
+| A | 22.4 | 3,048 | 194.6 | 63.1 | 1.32-1.21 / 1.61-1.50 | 10.2 |
+| B | 32.0 | 2,343 | 128.4 | 36.6 | 1.44 / 1.73 | 3.4 |
+| A | 22.7 | 2,747 | 187.8 | 60.8 | 1.32-1.21 / 1.61-1.40 | 10.1 |
+| B | 29.1 | 3,214 | 161.3 | 43.0 | 1.56 / 1.84 | 3.2 |
+| A | 23.4 | 2,402 | 178.6 | 52.8 | 1.21 / 1.50-1.40 | 9.4 |
+| B | 30.4 | 2,587 | 129.7 | 34.4 | 1.44 / 1.73 | 1.5 |
+
+At equal draws (linear fit per side): about 25% fewer cycles a frame over all game threads and
+about 35% fewer instructions on the job threads. The main and render threads spin while they wait,
+so their counts include waiting and understate the gain. The audio mixer executes about 18% fewer
+instructions a second but nearly the same cycles (809-843 against 818-897 M a second): its time is
+not in instruction count. An earlier series the same morning (CPU time only) gave A 24.5 and 25.3
+fps, B 40.6 (and 56.9 from a cold phone at 1,077 draws). No crash in five B runs.
+
+Two things changed with it:
+- The clock caps: in every pair the B run got looser CPU caps than the A runs next to it, at the
+  same or a higher thermal status. Less CPU work a frame leaves the CPU clusters cooler; the B runs
+  heat the battery faster all the same (37.8 -> 44.5-44.8 C against 41.4-41.8 C in 190 s), because
+  the GPU now works the whole frame.
+- **The phone is GPU-bound now.** With B the GPU is idle 1.5-4.7 ms a frame (9-12 ms with A) and
+  the record thread waits 2-5 ms a frame for a free frame slot (0.3 ms with A). GPU-side changes,
+  which did not move fps while the game's code set the frame (render scale, load-op clears, coarse
+  shading: all "no gain" on 10-31 and 11-22), are worth measuring again.
+
+Linux (i5-13420H, GPU shared with another job, so `--gtav_native_render_scale=0.25` to let the
+CPU side set the frame): 14 standing runs, old binary against max-perf. At equal draws the game's
+threads use roughly 5-9% less CPU a frame; fps is inside the run-to-run spread (about 10% here).
+The record thread, whose code did not change, drifted 4-6% the same way, so the real figure is at
+the low end. The game's code does not set the frame on this laptop. Flush-to-zero against
+denormals kept: no difference in two runs. 5-minute run-around soaks: clean on both builds of it.
+
 ## Perf session 11-23: the game's CPU side (branch `android-cpu`, off `mt-record`)
 
 Owner: "let's get android running insanely fast, like how can we speed up the game cpu stuff?"
@@ -79,7 +162,8 @@ Measured and left off / removed:
   2,508 draws and 135.8 at 1,902 without, 151.9 at 2,467 and 145.8 at 2,371 with: 2-4% less at
   equal draws, fps inside the run-to-run spread, no crash in eight runs. Left off: it rewrites
   every game function on every platform for a gain that small, and indirect calls into fragments,
-  setjmp and long play are untested. `tools/native/nv_local_manifest.patch` turns it on.
+  setjmp and long play are untested. (On in the `max-perf` line with the other register options,
+  see the top section; the manifest patch file is gone there.)
   (Two libraries cannot be flipped inside one run, so this comparison is between boots: the scene
   differs by several hundred draws from boot to boot, which is why it needs the per-frame CPU
   figure and cannot resolve less than about 3%.)

@@ -241,6 +241,16 @@ elseif(WIN32 AND NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     endif()
 endif()
 
+# Max-performance builds: the generated code runs in one floating-point denormal mode (denormals
+# kept) instead of switching before every FP instruction group (rex/ppc/context.h,
+# REX_FP_SINGLE_MODE). Differs from the console only in VMX arithmetic on values below 1.2e-38.
+# On by default here (max-perf branch: Linux and Android only); the release game library gets the
+# same define from loader/src/install.cpp.
+option(GTAV_FP_SINGLE_MODE "Generated code: one FP denormal mode, no per-instruction switch" ON)
+if(GTAV_FP_SINGLE_MODE AND TARGET gtav_recomp AND NOT WIN32 AND NOT APPLE)
+    target_compile_definitions(gtav_recomp PRIVATE REX_FP_SINGLE_MODE)
+endif()
+
 # Dev builds: inline the __savegprlr/__restgprlr helpers into every generated function
 # (fs/gprlr_inline.h, +2.6% on the main thread 11-14). Off by default: it changes the release's
 # game code, which waits for the owner (after v0.4.0).

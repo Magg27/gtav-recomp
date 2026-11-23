@@ -16,11 +16,22 @@ includes = []
 ctr_as_local = true
 xer_as_local = true
 cr_as_local = true
+# r14-r31, f14-f31, v14-v31/v64-v127 as locals: codegen drops the __savegprlr/__restgprlr calls
+# (the registers live in the C++ frame) and hands SEH funclets their registers through ctx.
+non_volatile_as_local = true
+# r0, r2, r11, r12, f0, v32-v63 as locals too (share_registers functions keep them in ctx and
+# get them handed over). The stack probe sub_83776424 reads r12 from its caller: as an ordinary
+# function it sees 0 and returns at once, which is right here (guest stacks are fully committed).
+non_argument_as_local = true
+# No ctx.lr store before every call (nothing in the game reads LR as data; no blrl).
+skip_lr = true
 # reserved_as_local: NO. GTA splits ldarx and stdcx. across functions (spin-lock helper sub_83829CD8),
 # so a per-function reservation never matches: a thread spins forever (hang 11-18).
 
 # Entry points the analyzer misses, for the TU27 build (0x00001B09). Base-build (v9) list: gtav_manifest.base_v9.toml.
 [entrypoint.functions]
+0x83452B24 = { share_registers = true }  # reads r11 from the function that branches into it
+0x83779360 = { share_registers = true }  # funclet: frame pointer in r12 from its caller
 0x82210398 = { size = 0x10 }  # orphan tail stub
 0x822103D8 = { size = 0x28 }  # orphan tail stub
 0x822271A0 = { size = 0x18 }  # orphan tail stub
@@ -50,8 +61,8 @@ cr_as_local = true
 0x826C9568 = {}  # pointer target
 0x826C9590 = {}  # pointer target
 0x827DDF88 = {}  # pointer target
-0x828CA2C8 = {}  # pointer target
-0x829ED654 = {}  # pointer target
+0x828CA2C8 = { share_registers = true }  # pointer target
+0x829ED654 = { share_registers = true }  # pointer target
 0x829FF2F0 = {}  # pointer target
 0x82B51B00 = {}  # pointer target
 0x82C6C3F8 = {}  # pointer target
@@ -110,27 +121,27 @@ cr_as_local = true
 0x83512150 = {}  # pointer target
 0x835F7728 = {}  # pointer target
 0x836065A8 = {}  # pointer target
-0x83776364 = {}  # skipped gap after terminator
-0x8377799C = {}  # skipped gap after terminator
-0x837787A4 = {}  # skipped gap after terminator
-0x837788CC = {}  # skipped gap after terminator
-0x8377A654 = {}  # skipped gap after terminator
-0x8377B3C8 = {}  # skipped gap after terminator
-0x8378013C = {}  # skipped gap after terminator
-0x83780330 = {}  # skipped gap after terminator
-0x8378818C = {}  # skipped gap after terminator
-0x83788308 = {}  # skipped gap after terminator
-0x83788C98 = {}  # skipped gap after terminator
-0x837891E8 = {}  # skipped gap after terminator
-0x8378A550 = {}  # skipped gap after terminator
-0x8378ABF0 = {}  # skipped gap after terminator
-0x83793E48 = {}  # skipped gap after terminator
-0x83794C28 = {}  # skipped gap after terminator
-0x83794F1C = {}  # skipped gap after terminator
-0x8379561C = {}  # skipped gap after terminator
-0x83795794 = {}  # pointer target
-0x837957D8 = {}  # skipped gap after terminator
-0x837A2C48 = {}  # skipped gap after terminator
+0x83776364 = { share_registers = true }  # skipped gap after terminator
+0x8377799C = { share_registers = true }  # skipped gap after terminator
+0x837787A4 = { share_registers = true }  # skipped gap after terminator
+0x837788CC = { share_registers = true }  # skipped gap after terminator
+0x8377A654 = { share_registers = true }  # skipped gap after terminator
+0x8377B3C8 = { share_registers = true }  # skipped gap after terminator
+0x8378013C = { share_registers = true }  # skipped gap after terminator
+0x83780330 = { share_registers = true }  # skipped gap after terminator
+0x8378818C = { share_registers = true }  # skipped gap after terminator
+0x83788308 = { share_registers = true }  # skipped gap after terminator
+0x83788C98 = { share_registers = true }  # skipped gap after terminator
+0x837891E8 = { share_registers = true }  # skipped gap after terminator
+0x8378A550 = { share_registers = true }  # skipped gap after terminator
+0x8378ABF0 = { share_registers = true }  # skipped gap after terminator
+0x83793E48 = { share_registers = true }  # skipped gap after terminator
+0x83794C28 = { share_registers = true }  # skipped gap after terminator
+0x83794F1C = { share_registers = true }  # skipped gap after terminator
+0x8379561C = { share_registers = true }  # skipped gap after terminator
+0x83795794 = { share_registers = true }  # pointer target
+0x837957D8 = { share_registers = true }  # skipped gap after terminator
+0x837A2C48 = { share_registers = true }  # skipped gap after terminator
 0x837A5058 = {}  # pointer target
 0x837A9050 = {}  # pointer target
 0x837A9058 = {}  # pointer target
@@ -158,8 +169,8 @@ cr_as_local = true
 0x837B6810 = {}  # pointer target
 0x837B9298 = {}  # pointer target
 0x837B9550 = {}  # pointer target
-0x837C2EA0 = {}  # skipped gap after terminator
-0x837C5A78 = {}  # skipped gap after terminator
+0x837C2EA0 = { share_registers = true }  # skipped gap after terminator
+0x837C5A78 = { share_registers = true }  # skipped gap after terminator
 0x837C6D00 = {}  # pointer target
 0x837C7210 = {}  # pointer target
 0x837C7220 = {}  # pointer target
@@ -168,9 +179,9 @@ cr_as_local = true
 0x838355B8 = {}  # pointer target
 0x838355D0 = {}  # pointer target
 0x8388E338 = {}  # pointer target
-0x83795654 = {}  # skipped gap after terminator
-0x837A2C58 = {}  # skipped gap after terminator
-0x837C5A88 = {}  # skipped gap after terminator
+0x83795654 = { share_registers = true }  # skipped gap after terminator
+0x837A2C58 = { share_registers = true }  # skipped gap after terminator
+0x837C5A88 = { share_registers = true }  # skipped gap after terminator
 0x82210400 = {}  # skipped gap after terminator
 0x8221830C = {}  # skipped gap after terminator
 0x822183CC = {}  # skipped gap after terminator
@@ -407,23 +418,23 @@ cr_as_local = true
 0x836686D4 = {}  # skipped gap after terminator
 0x836D9AA0 = {}  # skipped gap after terminator
 0x8371DE08 = {}  # skipped gap after terminator
-0x83777810 = {}  # skipped gap after terminator
-0x83778628 = {}  # skipped gap after terminator
-0x83778808 = {}  # skipped gap after terminator
-0x8377B228 = {}  # skipped gap after terminator
-0x8377FDA0 = {}  # skipped gap after terminator
-0x83780218 = {}  # skipped gap after terminator
-0x837803C0 = {}  # skipped gap after terminator
-0x837868D0 = {}  # skipped gap after terminator
-0x83788040 = {}  # skipped gap after terminator
-0x83788B20 = {}  # skipped gap after terminator
-0x8378AAA0 = {}  # skipped gap after terminator
-0x8378D758 = {}  # skipped gap after terminator
-0x83793DA8 = {}  # skipped gap after terminator
-0x83794378 = {}  # skipped gap after terminator
-0x83794C70 = {}  # skipped gap after terminator
-0x8379F0B8 = {}  # skipped gap after terminator
-0x837A2C00 = {}  # skipped gap after terminator
+0x83777810 = { share_registers = true }  # skipped gap after terminator
+0x83778628 = { share_registers = true }  # skipped gap after terminator
+0x83778808 = { share_registers = true }  # skipped gap after terminator
+0x8377B228 = { share_registers = true }  # skipped gap after terminator
+0x8377FDA0 = { share_registers = true }  # skipped gap after terminator
+0x83780218 = { share_registers = true }  # skipped gap after terminator
+0x837803C0 = { share_registers = true }  # skipped gap after terminator
+0x837868D0 = { share_registers = true }  # skipped gap after terminator
+0x83788040 = { share_registers = true }  # skipped gap after terminator
+0x83788B20 = { share_registers = true }  # skipped gap after terminator
+0x8378AAA0 = { share_registers = true }  # skipped gap after terminator
+0x8378D758 = { share_registers = true }  # skipped gap after terminator
+0x83793DA8 = { share_registers = true }  # skipped gap after terminator
+0x83794378 = { share_registers = true }  # skipped gap after terminator
+0x83794C70 = { share_registers = true }  # skipped gap after terminator
+0x8379F0B8 = { share_registers = true }  # skipped gap after terminator
+0x837A2C00 = { share_registers = true }  # skipped gap after terminator
 0x837A7BF4 = {}  # skipped gap after terminator
 0x837A7C18 = {}  # skipped gap after terminator
 0x837A7C40 = {}  # skipped gap after terminator
@@ -432,7 +443,7 @@ cr_as_local = true
 0x837B44E8 = {}  # skipped gap after terminator
 0x837B4510 = {}  # skipped gap after terminator
 0x837B4538 = {}  # skipped gap after terminator
-0x837C5A38 = {}  # skipped gap after terminator
+0x837C5A38 = { share_registers = true }  # skipped gap after terminator
 0x837E1FB0 = {}  # skipped gap after terminator
 0x837E206C = {}  # skipped gap after terminator
 0x837E3750 = {}  # skipped gap after terminator
@@ -443,3 +454,23 @@ cr_as_local = true
 0x834A2E10 = { size = 0x10 }  # vtable thunk (vtbl+92)
 0x834A2E20 = { size = 0x10 }  # vtable thunk (vtbl+84)
 0x834A2E30 = { size = 0x10 }  # vtable thunk (vtbl+24)
+
+0x8320D2E8 = { share_registers = true }  # reads a non-volatile from its caller (nv_livein.py)
+0x832C0160 = { share_registers = true }  # reads a non-volatile from its caller (nv_livein.py)
+0x833866F0 = { share_registers = true }  # reads a non-volatile from its caller (nv_livein.py)
+0x83777DF0 = { share_registers = true }  # reads a non-volatile from its caller (nv_livein.py)
+0x83778C30 = { share_registers = true }  # reads a non-volatile from its caller (nv_livein.py)
+0x8378C5E8 = { share_registers = true }  # reads a non-volatile from its caller (nv_livein.py)
+0x837966C0 = { share_registers = true }  # reads a non-volatile from its caller (nv_livein.py)
+0x83796A50 = { share_registers = true }  # reads a non-volatile from its caller (nv_livein.py)
+0x83798D30 = { share_registers = true }  # reads a non-volatile from its caller (nv_livein.py)
+0x837995D8 = { share_registers = true }  # reads a non-volatile from its caller (nv_livein.py)
+0x837A4DA8 = { share_registers = true }  # reads a non-volatile from its caller (nv_livein.py)
+0x837B9928 = { share_registers = true }  # reads a non-volatile from its caller (nv_livein.py)
+0x837BB598 = { share_registers = true }  # reads a non-volatile from its caller (nv_livein.py)
+0x837BBC98 = { share_registers = true }  # reads a non-volatile from its caller (nv_livein.py)
+0x837C8690 = { share_registers = true }  # reads a non-volatile from its caller (nv_livein.py)
+0x837D7558 = { share_registers = true }  # reads a non-volatile from its caller (nv_livein.py)
+
+0x83778778 = { share_registers = true }  # writes a non-volatile for its caller (nv_liveout.py)
+0x83778910 = { share_registers = true }  # writes a non-volatile for its caller (nv_liveout.py)

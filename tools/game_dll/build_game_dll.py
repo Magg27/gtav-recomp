@@ -36,7 +36,7 @@ CXXFLAGS = ["--target=x86_64-pc-windows-msvc", "-nostdinc++", "-nostdlibinc", "-
 CXXFLAGS_LINUX = ["--target=x86_64-linux-gnu", "-nostdinc++", "-nostdlibinc", "-fPIC",
                   "-fno-semantic-interposition", "-fno-stack-protector", "-fcf-protection=none", "-O2",
                   "-std=gnu++23", "-march=x86-64-v3", "-msse4.1", "-fno-exceptions", "-fno-rtti",
-                  "-fno-threadsafe-statics", "-fno-math-errno", "-w"]
+                  "-fno-threadsafe-statics", "-fno-math-errno", "-DREX_FP_SINGLE_MODE", "-w"]
 LDFLAGS_LINUX = ["-shared", "-soname", "gtav_game.so", "-Bsymbolic", "-z", "now", "-z", "relro",
                  "-z", "noexecstack", "--hash-style=gnu", "-O1"]
 # macOS arm64: no C runtime of our own (fs_crt.cpp is x86); memcpy & co. and log2f come from
@@ -55,7 +55,7 @@ LDFLAGS_MACOS = ["-arch", "arm64", "-platform_version", "macos", "15.0", "15.0",
 CXXFLAGS_ANDROID = ["--target=aarch64-linux-android30", "-nostdinc++", "-nostdlibinc", "-fPIC",
                     "-fno-semantic-interposition", "-fno-stack-protector", "-O2", "-std=gnu++23",
                     "-march=armv8.2-a+lse+rcpc+dotprod", "-fno-exceptions", "-fno-rtti",
-                    "-fno-threadsafe-statics", "-fno-math-errno", "-w"]
+                    "-fno-threadsafe-statics", "-fno-math-errno", "-DREX_FP_SINGLE_MODE", "-w"]
 LDFLAGS_ANDROID = ["-shared", "-soname", "libgtav_game.so", "-Bsymbolic", "-z", "now", "-z", "relro",
                    "-z", "noexecstack", "-z", "max-page-size=16384", "--hash-style=gnu", "-O1"]
 LINUX = sys.platform.startswith("linux")
@@ -86,10 +86,16 @@ def main():
                     help="macOS host: build gtav_game.dylib for the iOS app (arm64-apple-ios17, A14+)")
     a = ap.parse_args()
     android = a.android is not None
+    # GTAV_GAME_DEFINES="NAME ...": extra defines for the generated code (experiments).
+    extra_defs = ["-D" + d for d in os.environ.get("GTAV_GAME_DEFINES", "").split()]
 
     if android:
         clang = find_tool(a.llvm_bin, ["clang++", "clang-19", "clang++-19"])
         lld = find_tool(a.llvm_bin, ["ld.lld", "lld", "ld.lld-19"])
+        # A bundled lld built against another libxml2 does not start on every distribution:
+        # the system's ld.lld links the same objects.
+        if subprocess.run([lld, "--version"], capture_output=True).returncode != 0:
+            lld = next((w for w in map(shutil.which, ["ld.lld-20", "ld.lld-19", "ld.lld"]) if w), lld)
         cxxflags, ext = CXXFLAGS_ANDROID, ".o"
     elif MACOS:
         clang = find_tool(a.llvm_bin, ["clang++", "clang"])
@@ -122,9 +128,15 @@ def main():
     if MACOS or android:
         inc[2:2] = ["-isystem", a.simde or os.path.join(ROOT, "rexglue-sdk", "thirdparty", "simde")]
 
+    # An object is reused only if it is newer than its source and than the headers every source
+    # includes (the shutil.copy above gives the copies a new time, so compare with the originals).
+    hdr_time = max(os.path.getmtime(h) for h in (os.path.join(FS, "gtav_pch.h"),
+                                                 os.path.join(FS, "layout_check.h"),
+                                                 os.path.join(a.interface, "gtav_hooks.h")))
+
     def compile_one(src):
         obj = os.path.join(obj_dir, os.path.basename(src) + ext)
-        if os.path.exists(obj) and os.path.getmtime(obj) > os.path.getmtime(src):
+        if os.path.exists(obj) and os.path.getmtime(obj) > max(os.path.getmtime(src), hdr_time):
             return obj, 0.0, ""
         t = time.time()
         # clang-19 is the one binary in the bundled LLVM; it acts as clang++ with --driver-mode.
@@ -133,7 +145,7 @@ def main():
         # not on Apple targets (Mach-O has no overridable alias). Keep in sync with install.cpp.
         pre = ["-include", os.path.join(FS, "gprlr_inline.h")] \
             if (android or not MACOS) and os.path.dirname(src) == a.generated else []
-        r = subprocess.run([clang] + drv + cxxflags + inc + pre + ["-c", src, "-o", obj],
+        r = subprocess.run([clang] + drv + cxxflags + extra_defs + inc + pre + ["-c", src, "-o", obj],
                            capture_output=True, text=True)
         return (obj if r.returncode == 0 else None), time.time() - t, r.stderr[-2000:]
 

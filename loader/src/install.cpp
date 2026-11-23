@@ -1190,10 +1190,12 @@ class Installer {
       // Android phones, from any host: aarch64, API 30, ARMv8.2 (LSE atomics; Snapdragon 845 and
       // newer). Freestanding like the others: no NDK headers; simde from the package's android/.
       // Keep in sync with tools/game_dll/build_game_dll.py (CXXFLAGS_ANDROID).
+      // REX_FP_SINGLE_MODE (max-perf branch, Linux and Android): no denormal-mode switch around
+      // FP instructions (fs/gtav_pch.h).
       flags = {L"--target=aarch64-linux-android30", L"-nostdinc++", L"-nostdlibinc", L"-fPIC",
                L"-fno-semantic-interposition", L"-fno-stack-protector", L"-O2", L"-std=gnu++23",
                L"-march=armv8.2-a+lse+rcpc+dotprod", L"-fno-exceptions", L"-fno-rtti",
-               L"-fno-threadsafe-statics", L"-fno-math-errno", L"-w", L"-isystem",
+               L"-fno-threadsafe-statics", L"-fno-math-errno", L"-DREX_FP_SINGLE_MODE", L"-w", L"-isystem",
                (root_ / L"android" / L"include").wstring()};
     } else {
 #ifdef _WIN32
@@ -1210,7 +1212,7 @@ class Installer {
                   L"-fno-semantic-interposition", L"-fno-stack-protector",
                   L"-fcf-protection=none", L"-O2", L"-std=gnu++23", L"-march=x86-64-v3",
                   L"-msse4.1", L"-fno-exceptions", L"-fno-rtti", L"-fno-threadsafe-statics",
-                  L"-fno-math-errno", L"-w"};
+                  L"-fno-math-errno", L"-DREX_FP_SINGLE_MODE", L"-w"};
 #endif
     }
     flags.insert(flags.end(), {L"-isystem", (fsdir / L"include").wstring(), L"-I", gen.wstring()});
