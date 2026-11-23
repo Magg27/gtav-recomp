@@ -67,6 +67,7 @@ constexpr const char* kSettings[] = {
     "gpu_skip_rendering_lag_ms",
     "gtav_native_exact_cache",
     "gtav_native_texture_recheck_frames",
+    "gtav_native_record_workers",
     "gtav_touch_controls",
 #if !GTAV_MENU_PHONE
     "gtav_fullscreen",
@@ -255,6 +256,21 @@ void Build(uint32_t fps, double frame_ms) {
     if (ImGui::IsItemHovered())
       ImGui::SetTooltip("On: the emulated GPU trails the game by 2 ms instead of 6 (about 20%% more fps).\n"
                         "Off: the tested setting; with On, watch foliage and distant meshes while driving.");
+  }
+  {
+    // --gtav_native_record_workers (docs/HANDOFF_MT_RENDERER_2026-11-22.md). Live.
+    int workers = std::atoi(rex::cvar::GetFlagByName("gtav_native_record_workers").c_str());
+    workers = workers < 0 ? 0 : workers > 3 ? 3 : workers;
+    const char* names[] = {"Off", "1", "2", "3"};
+    ImGui::SetNextItemWidth(120.0f * g_scale);
+    if (ImGui::Combo("Record threads (experimental)", &workers, names, 4)) {
+      rex::cvar::SetFlagByName("gtav_native_record_workers", std::to_string(workers));
+      changed = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Extra threads that turn each frame into GPU commands next to the renderer's own.\n"
+                        "More fps where the renderer limits the frame rate (many draws, fast CPU);\n"
+                        "none, or slightly less, where the game itself is the limit (phones).");
   }
   ImGui::Separator();
   ImGui::TextUnformatted("Textures");

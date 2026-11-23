@@ -48,6 +48,12 @@ the render thread (no workers).
 | `--gtav_android_prime_exclusive`, `--gtav_android_guest_big` | false | Android thread placement tests (below) |
 | `--gtav_native_ab='a=x\|y;b=p\|q'` | | the in-run A/B can now flip several settings together |
 
+The in-game menu (F1 / Esc menu; RB + Back or the overlay button on phones) has **"Record threads
+(experimental)": Off / 1 / 2 / 3**, live, saved in `gtav_settings.ini` with the other settings.
+`gtav_settings.ini` is applied over the command line, so `--gtav_native_record_workers=N` only
+takes effect with `GTAV_IGNORE_SETTINGS=1` (the bench scripts set it) or before the menu has saved
+anything; `--gtav_native_ab=...` is not affected.
+
 The A/B line now reads `frame, median, p90; record, cpu, idle, GPU; draws, skipped, passes, barriers`
 per side. **`idle`** is the render thread waiting for the game's next frame: when it is several ms,
 the game sets the frame time and a faster renderer cannot raise fps. `cpu` is the render thread's
@@ -119,7 +125,8 @@ the game's own threads get faster. Workers stay off on Android.
    --gtav_native_ab='gtav_native_record_pad_ms=0|4'` in the open world. If the frame gets ~4 ms
    longer with the pad, recording sets the frame time on that machine and workers should pay off.
    If only `idle` shrinks, the game is the limit (as on the phone) and they will not.
-3. Then `--gtav_native_ab='gtav_native_record_workers=0|2'` (then `0|3`), 3+ in-world lines. Read
+3. Then `--gtav_native_ab='gtav_native_record_workers=0|2'` (then `0|3`), 3+ in-world lines (or,
+   by eye: the menu's "Record threads" with the FPS counter on). Read
    frame, record, idle. macOS is the best candidate: capture.cpp notes its renderer runs frames
    behind the game (record 20-33 ms in the open world).
 4. Picture check: same run with `GTAV_NATIVE_SHOT_DIR=<dir> GTAV_SHOT_FRAMES=15`, then
