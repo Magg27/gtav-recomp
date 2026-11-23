@@ -63,6 +63,12 @@ static uint64_t MetalAllocatedBytes() {
 #include <thread>
 #include <string>
 
+#if defined(__ANDROID__)
+#include <atomic>
+#include <unistd.h>
+extern std::atomic<int> gtav_android_render_tid;  // android_threads.cpp
+#endif
+
 REXCVAR_DECLARE(std::string, gtav_native);
 REXCVAR_DEFINE_BOOL(gtav_native_snapshot_draws, false, "GTAV",
                     "Copy every draw's vertex and index data at the D3D call instead of reading guest "
@@ -485,7 +491,15 @@ static void DrainIncomingCopies() {  // g_copy_mutex held
 static std::map<std::pair<uint64_t, uint32_t>, FenceCopy> g_fence_copies;  // (frame, draw)
 static uint64_t g_copy_floor = 0;           // frames below this were recorded
 static uint64_t g_recording = ~0ull;        // frame being recorded
-static std::atomic<uint32_t> g_recorded_draws{0};  // of g_recording: draws that read their data
+// Of g_recording: draws that read their data. Written by the renderer's record thread after
+// every draw, so it has a cache line of its own: it sat next to g_fence_address, which the game's
+// render thread wrote at every draw, and the two threads took the line from each other 3,000
+// times a frame (DrawsRecorded alone was 2.7% of the record thread on the S23 FE).
+struct alignas(64) RecordedDraws {
+  std::atomic<uint32_t> count{0};
+};
+static RecordedDraws g_recorded;
+static std::atomic<uint32_t>& g_recorded_draws = g_recorded.count;
 static std::atomic<uint32_t> g_fence_address{0};  // guest physical, where the GPU writes the fence
 static constexpr uint32_t kDevFence = 11036;      // next fence value (InsertFence 8380E440)
 static constexpr uint32_t kDevFenceDone = 11024;  // -> where the GPU writes the completed fence
@@ -694,6 +708,13 @@ static uint64_t g_copy_bytes[3][2];
 
 static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive, int32_t base_vertex,
                                uint32_t start, uint32_t count) {
+#if defined(__ANDROID__)
+  // The thread placement (android_threads.cpp) treats the game's render thread on its own.
+  if (thread_local bool told = false; !told) {
+    told = true;
+    gtav_android_render_tid.store(gettid(), std::memory_order_relaxed);
+  }
+#endif
   FlushIndexedVertices();
   if (!Active()) return nullptr;
   if (REXCVAR_GET(gtav_native_pm4_scan)) {
@@ -829,7 +850,12 @@ static DrawCommand* RecordDraw(uint32_t device, bool indexed, uint32_t primitive
   if (REXCVAR_GET(gtav_native_snapshot_draws) && !d.is_inline) {
     SnapshotDrawData(d, [](const uint8_t* data, uint32_t size) { return g_packet.Push(data, size); });
   } else if (!d.is_inline && REXCVAR_GET(gtav_native_fence_copy)) {
-    if (uint32_t done = be32(dev + kDevFenceDone)) g_fence_address = GuestPhysical(done);
+    // (Stored only when it changes, which is once: a store per draw kept the line in this
+    // thread's hands, and the command processor reads it at every fence.)
+    if (uint32_t done = be32(dev + kDevFenceDone)) {
+      const uint32_t address = GuestPhysical(done);
+      if (g_fence_address.load(std::memory_order_relaxed) != address) g_fence_address = address;
+    }
     PendingCopy p{GuestFrame(), uint32_t(g_packet.draws.size()), be32(dev + kDevFence), d.indexed, d.index32,
                   d.base_vertex, d.start, d.count, d.index_address, d.index_size, {}};
     std::copy(std::begin(d.streams), std::end(d.streams), p.streams);

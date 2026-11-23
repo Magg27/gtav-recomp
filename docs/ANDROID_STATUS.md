@@ -11,6 +11,74 @@ GTA V runs in-game on a Galaxy S23 FE (Snapdragon 8 Gen 1, Adreno 730, Android 1
 letterboxed, with on-screen touch controls (a Bluetooth pad hides them). About 10-15 fps while the
 GPU is thermally throttled (350 of 818 MHz after long sessions on the charger).
 
+## Perf session 11-23: the game's CPU side (branch `android-cpu`, off `mt-record`)
+
+Owner: "let's get android running insanely fast, like how can we speed up the game cpu stuff?"
+Method: measure where the CPU time goes, fix, same-run A/B (`tools/android/ab.sh`, flips every 60
+frames, both sides see the same heat), keep or drop. All runs muted; **sound was never checked by
+ear**.
+
+Tools (new):
+- `tools/android/cpu_probe.sh NAME [WARM] [SECS]`: per thread busy %, runnable-but-waiting %,
+  switches a second, which cores it ran on, the clock each cluster really ran at, and the hottest
+  functions of the busiest threads (simpleperf). `ATTACH=1` probes a game that is already running.
+- `tools/android/sched_trace.sh NAME` + `sched_trace.py`: from an atrace scheduler trace, who
+  wakes whom, wake-up delays split by idle/busy target core, and what the job threads were doing
+  whenever the main thread was not running.
+- The SDK now names every game thread `XThread<hardware thread>p<priority><id>`, so the tools (and
+  `android_threads.cpp`) can tell job threads (priority 1-15), the audio mixer (16+) and the rest.
+
+Where the phone is after this pass (final probe `cpu_final`, thermal status 3 at 44 C, caps
+1.21 GHz middle / 1.40-1.50 prime / 1.36 little): 4.93 cores busy and 2.37 cores' worth of
+threads waiting for a core. Main thread 68% of the prime core (+17% waiting; it was 40% + 39%
+before the pass), the game's audio mixer 65%, the game's render thread 61%, record thread 61%
+(70% before shared expansions), eight job threads 14-25% each. The frame is set by the game's own
+code; the record thread waits 4-9 ms a frame for it. Picture check with shared expansions off | on
+while walking (`walk_squares.sh --ab`): 0 wrongly lit tiles on both sides.
+
+Kept (a | b fps, same run, heaviest scenes last):
+- Four SDK fixes, commit 9391045 (alertable waits spinning on the clock, wake-all on semaphores
+  and auto-reset events, a useless XMA worker wake per kick, decoder tables rebuilt per sound):
+  28.3 | 30.2, 25.0 | 27.3, 25.2 | 27.4, 22.5 | 24.3, 21.3 | 23.5.
+- Main thread at nice -10 (`gtav_android_main_nice`): 24.7 | 25.7, 22.9 | 23.9, 19.6 | 22.2. It
+  sleeps and wakes ~2,400 times a second and found its core taken each time. -20 adds nothing.
+- Job threads at nice -8 (`gtav_android_job_nice`): 28.1 | 29.3, 28.4 | 28.2, 23.8 | 24.3,
+  21.5 | 22.5, 24.3 | 24.8.
+- Background helpers ("xma-fresh") on the little cores at low priority.
+- CPU rect lists share one expansion per frame (`gtav_native_rect_share`): the tiled lighting
+  draws the same 3,600 rects eight times with eight shader pairs, and each draw expanded and
+  uploaded them again. Record thread 21.98 | 18.82, 28.80 | 24.59, 32.51 | 29.05, 37.00 | 32.96,
+  37.43 | 33.39 ms a frame; fps 36.9 | 38.0, 28.7 | 29.6, 27.4 | 27.6, 24.1 | 24.3, 22.7 | 22.8
+  (the game sets the frame, so most of it shows up as record-thread idle time). Linux on the CPU
+  path: 17.3 -> 13.9 ms at ~2,650 draws, same picture (0 of 176 capture pairs differ).
+- `DrawsRecorded` on a cache line of its own (it shared one with a value the game's render thread
+  writes at every draw; 2.7% of the record thread).
+
+Measured and left off / removed:
+- Audio mixer thread at nice -10 (`gtav_android_audio_nice`): 32.4 | 31.3, 29.0 | 28.8,
+  30.4 | 29.8, 26.9 | 26.5, 25.4 | 24.7. Slightly worse.
+- The game's render thread at nice -8 (`gtav_android_render_nice`): 37.8 | 37.4, 31.2 | 29.4,
+  27.5 | 26.8, 23.9 | 23.2, 22.3 | 21.4. Worse: it takes time from the threads the frame waits for.
+- One record worker (`gtav_native_record_workers=1`): 33.1 | 31.0, 29.4 | 29.0, 30.9 | 30.2,
+  27.3 | 26.7, 25.9 | 24.8. Recording 24-29 -> 17-20 ms and the record thread's idle time doubles
+  (5-9 -> 13-19 ms): the extra thread only takes a core from the game.
+- Job threads off the little cores (`gtav_android_job_cores=1`): 29.5 | 28.5, 39.8 | 38.2,
+  35.1 | 32.6, 32.5 | 31.8, 27.2 | 24.8. Worse: they push the record and render threads around.
+- Two record workers on the big cores: 27.2 | 26.0, 23.5 | 21.7, 23.3 | 21.4, 23.3 | 21.9 (record
+  33 -> 19 ms, and 25 ms of it idle); on the little cores 26.3 | 25.8, 30.6 | 28.1, 31.2 | 27.9.
+- Spinning before a zero-length guest sleep (16 spins): 32.5 | 31.8 ... 24.2 | 23.3. Removed.
+- A 100 us sleep instead of a yield for low-priority guest threads' `Sleep(0)`: 27.7 | 27.2,
+  25.4 | 25.1, 25.6 | 26.1, 23.5 | 22.8, 23.7 | 23.9. No difference; the SDK keeps its 100 us.
+- Vblank thread slowed when vsync is off, skipping wakes of idle waiters, the prime core for the
+  main thread alone: no difference. Removed (the last one stays as a cvar, off).
+
+The rect-list geometry shader on Adreno 730, second look: DXC's SPIR-V still asserts in the
+driver's compiler in every form. The same shader written in GLSL and built with the NDK's glslc
+compiles, and then the tiled lighting's rects come out sheared/black, in six forms (select,
+branch, arithmetic weights, no rejection, two triangles, zero-padded streams); the same GLSL
+shader is right on Linux. Not pursued: with shared expansions the CPU path costs within 0.4 ms a
+frame of the geometry shader on a desktop (12.42 vs 12.07 ms at ~2,800 draws).
+
 ## Perf session 11-22: multithreaded recording built, phone not bound by it (branch `mt-record`)
 
 Full notes: `docs/HANDOFF_MT_RENDERER_2026-11-22.md`. `--gtav_native_record_workers=N` records a
@@ -136,6 +204,7 @@ under lldb (lldb-server via run-as); `simpleperf record --app com.gtavrecomp.app
 - Core `vkGetBufferDeviceAddress` is a null driver entry: plume prefers the KHR one.
 - minImageCount is 3: 5 swap chain images, or acquire blocks with frames in flight.
 - The rect-list geometry shader crashes the compiler: rect lists on the CPU (gtav_native_rect_gs).
+  (11-23: a GLSL build compiles but draws the lighting tiles wrong; see the 11-23 section.)
 - Failed pipelines: plume returns null now (it returned objects with null handles).
 
 ## SDK / SDL changes (rexglue-sdk-gtav-linux.patch, sdl3-gtav.patch, plume-gtav.patch)

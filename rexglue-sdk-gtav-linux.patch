@@ -4771,22 +4771,51 @@ index db830e4..f053f2a 100644
    bool success = semaphore_->Release(release_count, &previous_count);
    if (out_previous_count) {
 diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
-index 77bce25..6d780f0 100644
+index 77bce25..53be837 100644
 --- a/src/system/xthread.cpp
 +++ b/src/system/xthread.cpp
-@@ -37,6 +37,11 @@
+@@ -37,6 +37,13 @@
  #include <rex/thread.h>
  #include <rex/vec128.h>
  
 +// Guest Sleep(0): 0 yields (desktop: GTA V's update thread calls it ~1,500 times a frame from a
 +// backoff spin, and every microsecond slept there is frame time); N > 0 sleeps N microseconds
 +// instead. S23 FE same-run A/B 11-22, 0 vs 50: 20.5/18.1 vs 19.4/17.8 fps: yield there too.
++// (Also tried there: 16 yields in a row, then 50 us sleeps, so that the main thread's poll for its
++// job threads' output frees the prime core: 1-4% slower. The poll is the fastest way to notice.)
 +REXCVAR_DEFINE_INT32(guest_sleep_zero_us, 0, "Kernel",
 +                     "Guest Sleep(0): 0 = yield the core, N = sleep N microseconds (live)");
  REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
                      "Ignores game-specified thread priorities");
  
-@@ -470,7 +475,9 @@ X_STATUS XThread::Create() {
+@@ -183,6 +190,18 @@ void XThread::set_name(const std::string_view name) {
+   }
+ }
+ 
++// Guest threads the title did not name carry the game's own placement in their host name,
++// "XThread<hardware thread>p<priority><id>" (e.g. "XThread3p+020A4"): the title's scheduling
++// policy, and a profiler's thread list, can then tell the game's job, render and audio threads
++// apart. Refreshed when the game changes either.
++static void RefreshHostName(rex::thread::Thread* host, const std::string& name, uint32_t handle,
++                            uint8_t cpu, int32_t priority) {
++  if (!host || name.rfind("XThread", 0) != 0) return;
++  auto wanted = fmt::format("XThread{}p{:+03d}{:03X}", cpu % 10, std::clamp(priority, -99, 99),
++                            handle & 0xFFF);
++  if (host->name() != wanted) host->set_name(std::move(wanted));  // (games set these often)
++}
++
+ static uint8_t next_cpu = 0;
+ static uint8_t GetFakeCpuNumber(uint8_t proc_mask) {
+   // NOTE: proc_mask is logical processors, not physical processors or cores.
+@@ -441,6 +460,7 @@ X_STATUS XThread::Create() {
+ 
+     // Set name immediately, if we have one.
+     thread_->set_name(thread_name_);
++    RefreshHostName(thread_.get(), thread_name_, handle(), active_cpu(), priority_);
+ 
+     PROFILE_THREAD_ENTER(thread_name_.c_str());
+     PROFILE_THREAD_CREATED();
+@@ -470,7 +490,9 @@ X_STATUS XThread::Create() {
      set_name(fmt::format("XThread{:04X}", thread_->system_id()));
    }
  
@@ -4797,7 +4826,23 @@ index 77bce25..6d780f0 100644
      thread_->set_priority(creation_params_.creation_flags & 0x20 ? 1 : 0);
    }
  
-@@ -1025,8 +1032,14 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
+@@ -856,6 +878,7 @@ void XThread::SetPriority(int32_t increment) {
+   if (!REXCVAR_GET(ignore_thread_priorities)) {
+     thread_->set_priority(target_priority);
+   }
++  RefreshHostName(thread_.get(), thread_name_, handle(), active_cpu(), priority_);
+ }
+ 
+ void XThread::SetAffinity(uint32_t affinity) {
+@@ -901,6 +924,7 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
+   } else {
+     REXSYS_WARN("Too few processor cores - scheduling will be wonky");
+   }
++  RefreshHostName(thread_.get(), thread_name_, handle(), cpu_index, priority_);
+ }
+ 
+ bool XThread::GetTLSValue(uint32_t slot, uint32_t* value_out) {
+@@ -1025,8 +1049,16 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
      }
    } else {
      if (timeout_ms == 0) {
@@ -4806,6 +4851,8 @@ index 77bce25..6d780f0 100644
 +      // little so higher-priority threads get the core. priority_ is the guest increment, so it
 +      // must not be compared with the host ThreadPriority constants (kBelowNormal is 8 on POSIX:
 +      // every Sleep(0) became a 100 us nanosleep, ~1,500 times a frame on GTA V's update thread).
++      // (S23 FE same-run A/B 11-23, 100 us against a yield for those too: 27.7|27.2, 25.4|25.1,
++      // 25.6|26.1, 23.5|22.8, 23.7|23.9 fps: no difference.)
 +      if (priority_ < 0) {
          rex::thread::Sleep(std::chrono::microseconds(100));
 +      } else if (const int32_t us = REXCVAR_GET(guest_sleep_zero_us); us > 0) {

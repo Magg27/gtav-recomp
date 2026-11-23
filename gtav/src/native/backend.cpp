@@ -187,6 +187,9 @@ REXCVAR_DEFINE_BOOL(gtav_native_rect_gs, false, "GTAV", "Native renderer: expand
 #else
 REXCVAR_DEFINE_BOOL(gtav_native_rect_gs, true, "GTAV", "Native renderer: expand rect lists with a geometry shader (else on the CPU)");
 #endif
+REXCVAR_DEFINE_BOOL(gtav_native_rect_share, true, "GTAV",
+                    "CPU rect lists: draws of one frame that read the same guest vertices share one "
+                    "expansion (the tiled lighting's 8 passes over the same 3,600 rects; live)");
 REXCVAR_DEFINE_STRING(gtav_native_skip_vs, "", "GTAV", "Diagnostic: drop draws with these vertex shader hashes");
 REXCVAR_DEFINE_BOOL(gtav_native_slot_targets, false, "GTAV",
                     "Native renderer: separate render targets per frame in flight (frames overlap on the GPU)");
@@ -1810,6 +1813,9 @@ struct Backend::Impl {
   }
 
   bool rect_gs = true;  // rect lists expanded by rectlist_gs (false: on the CPU, see RectCorners)
+  // gtav_native_rect_gs is live (re-read every frame, for same-run comparisons): pipelines made
+  // under the other value than the one the run started with get keys of their own (PipelineKey).
+  bool rect_gs_capable = false, rect_gs_start = true;
   std::unique_ptr<RenderShader> blit_vs, blit_ps, rectlist_gs, depth_ps, resolve_ps, depth_pack_ps, diag_flat_ps, alpha_ps;
   std::unique_ptr<RenderPipeline> depth_pack_pipeline;
   std::unique_ptr<RenderPipeline> depth_copy_pipeline;
@@ -2610,11 +2616,23 @@ struct Backend::Impl {
     rectlist_gs = device->createShader(g_native_rectlist_gs, sizeof(g_native_rectlist_gs), "main",
                                        RenderShaderFormat::SPIRV);
     // Metal (MoltenVK) has no geometry shaders: rect lists are expanded on the CPU instead.
-    rect_gs = device->getCapabilities().geometryShader;
+    rect_gs_capable = device->getCapabilities().geometryShader;
+    rect_gs = rect_gs_capable;
     // Adreno reports geometry shaders, but its compiler asserts on the rect-list one ("cast<Ty>()
     // argument of incompatible type"): Android expands rect lists on the CPU by default.
+    // (11-23, Adreno 730: DXC's output asserts in every form tried; the same shader written in GLSL
+    // and built by glslc compiles, and then the tiled lighting's rects come out sheared, in six
+    // forms and with padded streams. Not pursued: with shared expansions (gtav_native_rect_share)
+    // the CPU path costs within 0.4 ms a frame of the geometry shader on a desktop.)
     if (!REXCVAR_GET(gtav_native_rect_gs)) rect_gs = false;
     if (!rect_gs) REXLOG_INFO("[native] no geometry shaders: rect lists expanded on the CPU");
+    rect_gs_start = rect_gs;
+    // Tile GPUs (phones, Apple) resolve by the compute / in-pass paths below. That was "no rect-list
+    // geometry shader", which the same platforms shared (and how a desktop run tries these paths).
+    bool tile_gpu = !rect_gs;
+#if defined(__ANDROID__) || defined(__APPLE__)
+    tile_gpu = true;
+#endif
     depth_ps = device->createShader(g_native_depth_ps, sizeof(g_native_depth_ps), "PSDepth", RenderShaderFormat::SPIRV);
     diag_flat_ps = device->createShader(g_native_diag_flat_ps, sizeof(g_native_diag_flat_ps), "PSDiagFlat",
                                         RenderShaderFormat::SPIRV);
@@ -2655,7 +2673,7 @@ struct Backend::Impl {
       memory_pipeline = device->createComputePipeline(cp);
     }
     // Compute colour resolves (tile GPUs): see native_resolve_compute.comp and ComputeResolve.
-    if (!rect_gs && REXCVAR_GET(gtav_native_compute_resolves)) {
+    if (tile_gpu && REXCVAR_GET(gtav_native_compute_resolves)) {
       RenderDescriptorSetBuilder textures, dest;
       textures.begin();
       textures.addTexture(0, kTextureDescriptors);
@@ -2685,7 +2703,7 @@ struct Backend::Impl {
       REXLOG_INFO("[native] compute colour resolves: {}", compute_resolves ? "on" : "unavailable");
     }
     // In-pass colour resolves (tile GPUs): see native_resolve_fetch.frag and FetchResolve.
-    if (!rect_gs && plume::g_colorInputAttachments) {
+    if (tile_gpu && plume::g_colorInputAttachments) {
       RenderDescriptorSetBuilder input, dest;
       input.begin();
       input.addInputAttachment(0);
@@ -3429,7 +3447,7 @@ struct Backend::Impl {
     } k{};
     k.vs = d.vs_hash;
     k.ps = d.ps_hash ^ (TileOverride(d.ps_hash) ? 1ull << 62 : 0);
-    k.topology = uint32_t(topology) | d.primitive << 8;
+    k.topology = uint32_t(topology) | d.primitive << 8 | (d.primitive == 8 && rect_gs != rect_gs_start ? 1u << 16 : 0);
     k.count = count;
     k.spec = spec;
     k.diag = diag;
@@ -3892,6 +3910,10 @@ struct Backend::Impl {
     uint64_t used = 0;
     std::unique_ptr<RenderBuffer> buffers[kMaxStreams];
     uint32_t sizes[kMaxStreams] = {};
+    // The frame's expansion, for the site's later draws of the same frame (DrawRecord::rect_share).
+    uint64_t shared_frame = ~0ull;
+    uint32_t shared_vertices = 0;
+    RenderVertexBufferView shared_views[kMaxStreams];
   };
   std::unordered_map<uint64_t, RectCache> rect_cache;
   uint64_t rect_hits = 0, rect_misses = 0;
@@ -4025,6 +4047,10 @@ struct Backend::Impl {
     bool has_depth = false;
     bool indirect = false;  // the vertex shader fetches by a computed index (indirect_fetch_shaders)
     bool rect_cpu = false;
+    // rect_cpu: the site's draws of one frame read the same guest vertices (not inline, not a
+    // snapshot, not indexed), so the first one's expansion serves the others. GTA's tiled lighting
+    // draws the same 3,600 rects with 8 shader pairs every frame.
+    bool rect_share = false;
     // (The arrays are not zeroed per draw: DrawFront sets every field of a record it returns.)
     CachedBuffer* stream_buffer[kMaxStreams];  // guest vertex buffers (null: inline, snapshot or rect data)
     uint64_t stream_key[kMaxStreams];
@@ -4788,11 +4814,17 @@ struct Backend::Impl {
     }
     rec.rect = nullptr;
     rec.rect_site = 0;
+    rec.rect_share = false;
     if (rect_cpu) {
+      // Shared sites are the same for every vertex shader: the expansion works on the shader's
+      // inputs, and only whether it fetches by a computed index changes what is read.
+      rec.rect_share = REXCVAR_GET(gtav_native_rect_share) && !d.indexed && !d.is_inline &&
+                       !(d.snap_vertices && !rec.indirect);
       struct SiteKey {
         uint64_t layout, vs;
         uint32_t start, count, base_vertex, index_address, indexed;
-      } k{decl.layout_hash, d.vs_hash, d.start, d.count, uint32_t(d.base_vertex), d.index_address, d.indexed};
+      } k{decl.layout_hash, rec.rect_share ? reinterpret_cast<uintptr_t>(&decl) ^ uint64_t(rec.indirect) : d.vs_hash,
+          d.start, d.count, uint32_t(d.base_vertex), d.index_address, d.indexed};
       rec.rect_site = Hash(&d.streams, sizeof(d.streams), Hash(&k, sizeof(k)));
       rec.rect = &rect_cache[rec.rect_site];
     }
@@ -4983,7 +5015,11 @@ struct Backend::Impl {
     return b.buffer.get();
   }
 
-  bool RectGather(RecordContext& rc, const FramePacket& f, const DrawCommand& d, bool indirect, uint32_t* max_vertex) {
+  // The source vertex of every rect corner, counted from the lowest one the draw uses
+  // (*min_vertex): the streams are converted and hashed from there, not from the start of the
+  // buffer (a draw far into a shared buffer paid for everything before it).
+  bool RectGather(RecordContext& rc, const FramePacket& f, const DrawCommand& d, bool indirect, uint32_t* min_vertex,
+                  uint32_t* max_vertex) {
     uint32_t rects = d.count / 3;
     rc.rect_src.resize(size_t(rects) * 3);
     if (!rects) return false;
@@ -4991,7 +5027,7 @@ struct Backend::Impl {
     const uint32_t first_index = d.snap_index_size ? 0 : d.start;
     const IndexSource ix = IndexData(f, d);
     if (d.indexed && (!ix.data || !ix.bytes)) return false;
-    uint32_t unit = d.index32 ? 4 : 2, top = 0;
+    uint32_t unit = d.index32 ? 4 : 2, top = 0, low = ~0u;
     for (uint32_t i = 0; i < rects * 3; i++) {
       int64_t v;
       if (!d.indexed) {
@@ -5006,33 +5042,57 @@ struct Backend::Impl {
         v = int64_t(index) + d.base_vertex - snap_first;
       }
       rc.rect_src[i] = v < 0 || v >= (1 << 24) ? ~0u : uint32_t(v);
-      if (rc.rect_src[i] != ~0u) top = std::max(top, rc.rect_src[i]);
+      if (rc.rect_src[i] != ~0u) top = std::max(top, rc.rect_src[i]), low = std::min(low, rc.rect_src[i]);
     }
-    *max_vertex = top;
+    if (low == ~0u) low = 0;  // no vertex in range
+    if (low)
+      for (uint32_t& v : rc.rect_src)
+        if (v != ~0u) v -= low;
+    *min_vertex = low;
+    *max_vertex = top - low;
     return true;
   }
 
   void RectDraw(RecordContext& rc, const DrawRecord& rec, const uint32_t rect_slot[], RenderVertexBufferView views[]) {
     const DrawCommand& d = *rec.d;
     const vertex_layout::HostLayout& vl = rec.decl->vl;
-    uint64_t content = Hash(rc.rect_src.data(), rc.rect_src.size() * sizeof(uint32_t), rec.rect_site);
-    for (uint32_t s = 0; s < kMaxStreams; s++)
-      if (vl.stream_used[s]) content = Hash(rc.rect_guest[s], size_t(rc.rect_vertices[s]) * rc.rect_stride[s], content);
     RectCache& c = *rec.rect;
+    // A site whose bytes keep changing (the tiled lighting's rects while the camera moves) is not
+    // hashed either, until the next check for whether it settled (every 64 frames).
+    bool changing;
+    {
+      std::lock_guard lock(CacheLock(rec.rect_site));
+      changing = c.misses >= 3 && (frame & 63) != 0;
+    }
+    uint64_t content = 0;
+    if (!changing) {
+      content = Hash(rc.rect_src.data(), rc.rect_src.size() * sizeof(uint32_t), rec.rect_site);
+      for (uint32_t s = 0; s < kMaxStreams; s++)
+        if (vl.stream_used[s]) content = Hash(rc.rect_guest[s], size_t(rc.rect_vertices[s]) * rc.rect_stride[s], content);
+    }
     std::lock_guard lock(CacheLock(rec.rect_site));
     c.used = frame;
-    if (c.ready && c.content_valid && c.content == content) {
-      rc.rect_hits++;
-      for (uint32_t s = 0; s < kMaxStreams; s++)
-        if (vl.stream_used[s])
-          views[rect_slot[s]] = RenderVertexBufferView(RenderBufferReference(c.buffers[s].get()), c.sizes[s]);
-      return;
+    // Kept (a buffer of its own) only once the same bytes came a second time: a site drawn once,
+    // or one that changes, would otherwise create and drop a buffer per draw.
+    bool stable = false;
+    if (changing) {
+      c.content_valid = false;
+    } else {
+      stable = c.content_valid && c.content == content;
+      if (stable && c.ready) {
+        rc.rect_hits++;
+        for (uint32_t s = 0; s < kMaxStreams; s++)
+          if (vl.stream_used[s])
+            views[rect_slot[s]] = RenderVertexBufferView(RenderBufferReference(c.buffers[s].get()), c.sizes[s]);
+        ShareRect(rc, rec, rect_slot, views);
+        return;
+      }
+      if (c.content_valid && !stable) c.misses++;
+      if ((frame & 63) == 0) c.misses = 0;  // a site that changed may have settled
+      c.content = content;
+      c.content_valid = true;
     }
     rc.rect_misses++;
-    if (c.content_valid && c.content != content) c.misses++;
-    if ((frame & 63) == 0) c.misses = 0;  // a site that changed may have settled
-    c.content = content;
-    c.content_valid = true;
     for (uint32_t s = 0; s < kMaxStreams; s++) {
       if (!vl.stream_used[s]) continue;
       const uint32_t host_stride = vl.host_stride[s];
@@ -5046,9 +5106,20 @@ struct Backend::Impl {
                        host_stride, rc.rect_vertices[s]);
       }
     }
-    const bool cache = c.misses < 3;
-    c.ready = cache;
-    RectExpand(rc, d, vl, rect_slot, views, cache ? &c : nullptr);
+    c.ready = stable;
+    RectExpand(rc, d, vl, rect_slot, views, stable ? &c : nullptr);
+    ShareRect(rc, rec, rect_slot, views);
+  }
+  // (Under the site's CacheLock.) Upload memory lasts for the frame, like the cached buffers.
+  void ShareRect(RecordContext& rc, const DrawRecord& rec, const uint32_t rect_slot[],
+                 const RenderVertexBufferView views[]) {
+    if (!rec.rect_share) return;
+    RectCache& c = *rec.rect;
+    const vertex_layout::HostLayout& vl = rec.decl->vl;
+    for (uint32_t s = 0; s < kMaxStreams; s++)
+      if (vl.stream_used[s]) c.shared_views[s] = views[rect_slot[s]];
+    c.shared_vertices = uint32_t(rc.rect_src.size() / 3) * 6;
+    c.shared_frame = frame;
   }
 
   // Each rect -> (corner, a, b, b, a, fourth): native_rectlist.hlsl on the vertex shader inputs
@@ -5201,10 +5272,26 @@ struct Backend::Impl {
     uint32_t slot_count = 0;
     const bool rect_cpu = rec.rect_cpu;
     uint32_t rect_slot[kMaxStreams];
-    uint32_t rect_max = 0;
-    if (rect_cpu && !RectGather(rc, f, d, rec.indirect, &rect_max)) {
-      rc.skipped++;
-      return;
+    uint32_t rect_min = 0, rect_max = 0;
+    bool rect_shared = false;  // expanded by an earlier draw of this frame
+    uint32_t rect_draw_vertices = 0;
+    RenderVertexBufferView rect_shared_views[kMaxStreams];
+    if (rect_cpu && rec.rect_share) {
+      std::lock_guard lock(CacheLock(rec.rect_site));
+      const RectCache& c = *rec.rect;
+      if (c.shared_frame == frame) {
+        rect_shared = true;
+        rect_draw_vertices = c.shared_vertices;
+        for (uint32_t s = 0; s < kMaxStreams; s++) rect_shared_views[s] = c.shared_views[s];
+        rc.rect_hits++;
+      }
+    }
+    if (rect_cpu && !rect_shared) {
+      if (!RectGather(rc, f, d, rec.indirect, &rect_min, &rect_max)) {
+        rc.skipped++;
+        return;
+      }
+      rect_draw_vertices = uint32_t(rc.rect_src.size() / 3) * 6;
     }
     for (uint32_t s = 0; s < kMaxStreams; s++) {
       if (!vl.stream_used[s]) continue;
@@ -5215,10 +5302,15 @@ struct Backend::Impl {
       uint32_t host_stride = vl.host_stride[s];
       const bool snapped = d.snap_vertices && !inline_data && !rec.indirect;
       if (snapped) vertices = d.snap_vertices;  // the snapshot starts at vertex snap_first
-      if (rect_cpu) vertices = std::min(vertices, rect_max + 1);
-      const uint8_t* guest = inline_data ? f.At(d.inline_vertices)
-                             : snapped   ? f.At(d.snap_stream[s])
-                                         : mem->TranslatePhysical(sb.address + sb.offset);
+      uint32_t rect_skip = 0;  // rect lists: only the vertices the rects use (RectGather)
+      if (rect_cpu) {
+        rect_skip = std::min(vertices, rect_min);
+        vertices = std::min(vertices - rect_skip, rect_max + 1);
+      }
+      const uint8_t* guest = (inline_data ? f.At(d.inline_vertices)
+                              : snapped   ? f.At(d.snap_stream[s])
+                                          : mem->TranslatePhysical(sb.address + sb.offset)) +
+                             size_t(rect_skip) * stride;
       StreamJob job;
       job.guest = guest, job.stride = stride, job.host_stride = host_stride, job.vertices = vertices;
       for (uint32_t n = 0; n < vl.element_count; n++) {
@@ -5231,6 +5323,11 @@ struct Backend::Impl {
         ConvertStream(j);
       };
       RenderBufferReference ref;
+      if (rect_shared) {
+        views[slot_count] = rect_shared_views[s];
+        slots[slot_count++] = RenderInputSlot(s, host_stride);
+        continue;
+      }
       if (rect_cpu) {  // converted and expanded below (RectDraw), unless cached
         rc.rect_guest[s] = guest;
         rc.rect_stride[s] = stride;
@@ -5312,7 +5409,7 @@ struct Backend::Impl {
         std::memcpy(record + 8, fields, sizeof(fields));
       }
     }
-    if (rect_cpu) RectDraw(rc, rec, rect_slot, views);
+    if (rect_cpu && !rect_shared) RectDraw(rc, rec, rect_slot, views);
     views[slot_count] = RenderVertexBufferView(RenderBufferReference(zero_buffer.get()), 256);
     slots[slot_count++] = RenderInputSlot(kDummyStream, 0);
     rc.prof.Mark(rc.prof.streams);
@@ -5398,7 +5495,7 @@ struct Backend::Impl {
     const uint32_t first_index = d.snap_index_size ? 0 : d.start;
     const IndexSource ix = IndexData(f, d);
     if (rect_cpu) {
-      list->drawInstanced(uint32_t(rc.rect_src.size() / 3) * 6, 1, 0, 0);
+      list->drawInstanced(rect_draw_vertices, 1, 0, 0);
     } else if (d.primitive == 13 || d.primitive == 5) {
       // Quad list -> triangle list (0 1 2, 0 2 3 per quad); triangle fan -> triangle list (0 i i+1).
       const bool quad = d.primitive == 13;
@@ -6549,6 +6646,7 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
   s.EvictTextures();
   s.EvictRectCache();
   s.EvictSnapCache();
+  s.rect_gs = s.rect_gs_capable && REXCVAR_GET(gtav_native_rect_gs);
   s.InvalidateDrawState();
   s.prof = {};
   s.prof.on = f.index % 8 == 0;

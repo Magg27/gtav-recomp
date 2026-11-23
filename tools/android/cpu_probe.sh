@@ -6,6 +6,8 @@
 #   tools/android/cpu_probe.sh NAME [WARMUP_SECS] [SECS] [flags/env: for args.txt ...]
 # Starts the game (muted, with stats), waits WARMUP_SECS (default 120), measures SECS (default 20),
 # stops the game. Writes logs/android/NAME.probe.txt (summary), NAME.perf.txt, NAME.log.
+# ATTACH=1: the game is already running (e.g. under ab.sh); only the per-thread and clock-speed
+# part, over SECS seconds, without the profiler, and the game is left alone.
 source ~/android-tools/env.sh
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 PKG=com.gtavrecomp.app
@@ -16,8 +18,10 @@ shift 3 2>/dev/null || shift $#
 adb wait-for-device
 out=$ROOT/logs/android/$name
 mkdir -p "$ROOT/logs/android"
-"$ROOT/tools/android/set_args.sh" --gtav_native_stats=true --audio_mute=true "$@"
-KEEP=1 "$ROOT/tools/android/run.sh" "$warm" 0 >/dev/null
+if [ "${ATTACH:-0}" != 1 ]; then
+  "$ROOT/tools/android/set_args.sh" --gtav_native_stats=true --audio_mute=true "$@"
+  KEEP=1 "$ROOT/tools/android/run.sh" "$warm" 0 >/dev/null
+fi
 pid=$(adb shell pidof $PKG | tr -d '\r')
 [ -n "$pid" ] || { echo "the game is not running after $warm s"; exit 1; }
 snap() {  # every thread's name, stat and schedstat; every cluster's time at each clock speed
@@ -26,6 +30,13 @@ snap() {  # every thread's name, stat and schedstat; every cluster's time at eac
     dumpsys battery | grep -m1 '^  temperature'; dumpsys thermalservice | grep -m1 'Thermal Status'"
 }
 snap > "$out.snap0"
+if [ "${ATTACH:-0}" = 1 ]; then
+  sleep "$secs"
+  snap > "$out.snap1"
+  rm -f "$out.cpus"
+  python3 "$ROOT/tools/android/cpu_probe.py" "$out" | tee "$out.probe.txt"
+  exit 0
+fi
 adb shell "simpleperf record --app $PKG -e cpu-clock -f 2000 --call-graph fp --duration $secs -o /data/local/tmp/gtav.perf" >/dev/null 2>&1
 snap > "$out.snap1"
 adb shell am force-stop $PKG
