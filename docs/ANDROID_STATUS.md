@@ -27,6 +27,12 @@ frame on N extra threads (off by default everywhere). On the S23 FE two workers 
   27-32 fps against 30-37), with small chunks (neutral), nothing but the main thread on the prime
   core (`gtav_android_prime_exclusive`, neutral), the game's threads off the little cores
   (`gtav_android_guest_big`, worse).
+- Also off after a test: the guest GPU thread released when the frame is recorded instead of
+  after the present (`gtav_native_early_fence`): 44.47 vs 44.50, 44.55 vs 44.17 ms.
+- The one-piece draw code (`DrawImpl`) is gone: every draw now goes through the two halves, on the
+  render thread when workers are off. Same run, old against new on the phone: render thread CPU
+  26.05 vs 26.35 and 22.35 vs 22.63 ms, frame 33.5 vs 34.3 and 31.1 vs 31.4 ms; walk check 0
+  wrongly lit tiles on both. Commit 74463ae is the last with both paths.
 - What would move phone fps now: less CPU work in total on the fast cores (the renderer's vertex
   hashing without a write watch ~10 ms a frame, the driver's ~10 ms of draw calls, the audio
   thread), or a faster main thread. Not more threads.
