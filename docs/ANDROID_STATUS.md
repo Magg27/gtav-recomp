@@ -229,7 +229,10 @@ Third batch, same day:
   frame, the phone reaches status 3 during the warm-up and the window is measured at a 285 MHz
   cap. Profile with the new defaults (`mpb7_prof`): the three lock calls 0.2% of the process's
   samples (were 3.9), mutex lock + unlock 0.5% (5.6), all `syscall` time 6.9% (11.0), the 018xx
-  job pool 57% of a core (71).
+  job pool 57% of a core (71). One 12-minute session per mode from the same battery
+  temperature (36.9 C, `mpb8_long`) says nothing about fps: the two sessions drifted into
+  different scenes (2,650-3,270 draws with the lock, 1,010-1,800 without; 24-29 against
+  35-40 fps in windows 2-5), so only the same-run A/B above compares like with like.
   Linux at quarter size, same scene (2,035 draws), old | new binary: the four job threads
   56.3 | 38.1 and 59.4 | 35.2 % of a core, main thread 46.5 | 43.9 and 54.4 | 44.3, fps 54.6 | 62.1
   and 58.9 (1,721 draws) | 59.7.
@@ -249,6 +252,38 @@ Third batch, same day:
 - Measured the same way and dropped: a lock-free "are interrupts on" test plus 200 tries before a
   waiting thread sleeps, still with the global lock (38.0 | 38.4, 42.3 | 44.8, 31.4 | 30.7,
   30.5 | 31.6, 28.7 | 28.9, 27.3 | 27.2, 27.0 | 26.9 fps): superseded by not taking the lock.
+
+Fourth batch, same day (SDK waits, from the profile taken after the third batch):
+- **Events and semaphores wake their waiter after releasing the handle's mutex**
+  (`posix_wake_unlocked`, SDK `threading_posix.cpp`). The signalling thread called
+  `notify_one` while it still held the mutex the woken thread needs to return from its wait, so
+  that thread went back to sleep on the mutex at once and the unlock had to make a second kernel
+  call to wake it; neither bionic nor glibc moves the waiter over. A thread in a multi-handle
+  wait woken that way found the mutex taken and spun on `sched_yield` until the signaller got
+  to its unlock: that was most of the game's audio callback thread. Kernel objects are
+  reference-counted and the caller holds a reference across the call, and the host-side events
+  are members of long-lived objects, so the handle outlives the wake-up.
+  Profile before | after (`mpb7_prof` | `mpb9_prof`, share of the process's samples): kernel calls
+  made by a mutex unlock 1.20 | 0.27%, threads sleeping on a mutex 0.53 | 0.14%, `sched_yield`
+  inside multi-handle waits 0.86 | 0.00%, the audio callback thread 1.59 | 0.58%, all kernel
+  calls (`syscall`) 6.96 | 5.29%, all `sched_yield` 1.81 | 0.76%. Same-run A/B on the phone,
+  under | after: 34.2 | 33.9, 34.6 | 34.5, 33.7 | 33.4, 31.5 | 32.0, 37.3 | 39.6, 30.1 | 30.4,
+  28.8 | 29.2 fps with the GPU capped at 285-317 MHz and working 23-32 ms a frame (it sets the
+  frame; the saving is CPU time, not fps), 0 bad lines.
+  Linux same-run A/B at quarter size, under | after: 71.5 | 69.6, 51.9 | 47.7, 44.2 | 45.9,
+  55.0 | 65.6, 62.9 | 59.5, 52.4 | 53.7, 45.5 | 47.9, 57.7 | 59.2 fps (mean 55.1 | 56.1: the shared
+  GPU sets the frame there, nothing to see).
+- Measured and not kept: the critical-section spin loop reading the lock word before it tries
+  the swap, with a pause in between. Four job threads spend about half of their job function
+  (833CB750, which takes one global section for every batch of work) spinning for that section,
+  1.5% of the process's samples; the change moved the spinning from the failed swaps into the
+  loop (swaps 1.19 -> 0.33%, the loop itself 0.36 -> 1.40%) and saved nothing.
+- What the profile says is left on the CPU side, largest first: hashing guest textures and
+  vertex buffers every frame for want of a write watch (three `gtav-hash` threads on the little
+  cores, 11-12% of the process's samples: 340-530 textures up to 64 KB, 7-10 MB, and 1,000-2,000
+  vertex buffers a frame), the game's own audio mixer and XMA decoding (11-12%), the driver under
+  the record thread, and ~5% in kernel calls for waking and parking job threads (~4,000 tiny jobs
+  a second).
 
 ## Perf session 11-23: the game's CPU side (branch `android-cpu`, off `mt-record`)
 

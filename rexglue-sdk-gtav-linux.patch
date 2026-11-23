@@ -2740,7 +2740,7 @@ index 5e0a932..cd75b74 100644
  
  bool& seh_active() {
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 9ac8d15..e2c0e6c 100644
+index 9ac8d15..36e66c1 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
 @@ -36,20 +36,24 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
@@ -2771,7 +2771,7 @@ index 9ac8d15..e2c0e6c 100644
  // SIGEV_THREAD_ID in timer_create(...) is a Linux extension
  #define REX_HAS_SIGEV_THREAD_ID 1
  #ifdef __GLIBC__
-@@ -62,33 +66,32 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+@@ -62,33 +66,39 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
  #define REX_HAS_SIGEV_THREAD_ID 0
  #endif
  
@@ -2782,6 +2782,13 @@ index 9ac8d15..e2c0e6c 100644
 +REXCVAR_DEFINE_BOOL(posix_wake_one, true, "Kernel",
 +                    "A semaphore release of one or an auto-reset event wakes one waiter instead of all "
 +                    "of them (live)");
++// The wake-up after the mutex is released. A waiter woken while the signalling thread still holds
++// the handle's mutex goes straight back to sleep on that mutex, and the unlock then needs a second
++// kernel call to wake it again (bionic and glibc do not move the waiter over): S23 FE 11-23,
++// 0.9% of the process's samples in those unlocks, and 5% of a job thread's time re-taking the
++// mutex. The caller holds a reference on the handle, so it outlives the wake-up.
++REXCVAR_DEFINE_BOOL(posix_wake_unlocked, true, "Kernel",
++                    "Events and semaphores: release the handle's mutex before waking a waiter");
 +// Alertable waits with a timeout cut the time left to whole milliseconds, and 0 means "do not
 +// block": the last partial millisecond of every such wait, and all of a 1 ms wait, was a busy
 +// loop on the clock. The GPU command thread idles in 1 ms alertable waits: S23 FE, 67% of its
@@ -2826,7 +2833,7 @@ index 9ac8d15..e2c0e6c 100644
  #endif
  
  template <typename _Rep, typename _Period>
-@@ -267,10 +270,35 @@ static sem_t* RexCreateAnonymousSemaphore() {
+@@ -267,10 +277,35 @@ static sem_t* RexCreateAnonymousSemaphore() {
  }
  #endif  // __APPLE__
  
@@ -2863,7 +2870,7 @@ index 9ac8d15..e2c0e6c 100644
      // Use robust mutexes so waits can recover if owner thread terminates.
      pthread_mutexattr_t attr;
      if (pthread_mutexattr_init(&attr) == 0) {
-@@ -290,7 +318,7 @@ class PosixConditionBase {
+@@ -290,7 +325,7 @@ class PosixConditionBase {
    WaitResult Wait(std::chrono::milliseconds timeout) {
      bool executed;
      auto predicate = [this] { return this->signaled(); };
@@ -2872,7 +2879,7 @@ index 9ac8d15..e2c0e6c 100644
      auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
      int lock_result = pthread_mutex_lock(native_mutex);
      if (lock_result == EOWNERDEAD) {
-@@ -330,12 +358,28 @@ class PosixConditionBase {
+@@ -330,12 +365,28 @@ class PosixConditionBase {
        return std::make_pair(result, 0);
      }
  
@@ -2901,7 +2908,7 @@ index 9ac8d15..e2c0e6c 100644
        size_t first_signaled = std::numeric_limits<size_t>::max();
        bool condition_met = false;
        bool all_locked = true;
-@@ -344,7 +388,7 @@ class PosixConditionBase {
+@@ -344,7 +395,7 @@ class PosixConditionBase {
        locks.reserve(handles.size());
  
        for (size_t i = 0; i < handles.size(); ++i) {
@@ -2910,7 +2917,7 @@ index 9ac8d15..e2c0e6c 100644
          auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
          int result = pthread_mutex_trylock(native_mutex);
          if (result == 0 || result == EOWNERDEAD) {
-@@ -411,6 +455,19 @@ class PosixConditionBase {
+@@ -411,6 +462,19 @@ class PosixConditionBase {
          return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
        }
  
@@ -2930,7 +2937,7 @@ index 9ac8d15..e2c0e6c 100644
        if (timeout == std::chrono::milliseconds::max()) {
          std::this_thread::sleep_for(std::chrono::milliseconds(1));
        } else {
-@@ -418,6 +475,7 @@ class PosixConditionBase {
+@@ -418,6 +482,7 @@ class PosixConditionBase {
          auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
          std::this_thread::sleep_for(sleep_time);
        }
@@ -2938,11 +2945,12 @@ index 9ac8d15..e2c0e6c 100644
      }
    }
  
-@@ -449,7 +507,14 @@ class PosixCondition<Event> : public PosixConditionBase {
+@@ -449,7 +514,15 @@ class PosixCondition<Event> : public PosixConditionBase {
    bool Signal() override {
      auto lock = std::unique_lock<std::mutex>(mutex_);
      signal_ = true;
 -    cond_.notify_all();
++    if (REXCVAR_GET(posix_wake_unlocked)) lock.unlock();
 +    // An auto-reset event serves one waiter (the first to run takes it; a second Set meanwhile
 +    // wakes another, which finds it taken and waits again, as before).
 +    if (!manual_reset_ && REXCVAR_GET(posix_wake_one)) {
@@ -2954,11 +2962,12 @@ index 9ac8d15..e2c0e6c 100644
      return true;
    }
  
-@@ -486,7 +551,12 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+@@ -486,7 +559,13 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
        *out_previous_count = count_;
      }
      count_ += release_count;
 -    cond_.notify_all();
++    if (REXCVAR_GET(posix_wake_unlocked)) lock.unlock();
 +    if (release_count == 1 && REXCVAR_GET(posix_wake_one)) {
 +      cond_.notify_one();
 +    } else {
@@ -2968,7 +2977,7 @@ index 9ac8d15..e2c0e6c 100644
      return true;
    }
  
-@@ -494,7 +564,8 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+@@ -494,7 +573,8 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
    inline bool signaled() const override { return count_ > 0; }
    inline void post_execution() override {
      count_--;
@@ -2978,7 +2987,7 @@ index 9ac8d15..e2c0e6c 100644
    }
    uint32_t count_;
    const uint32_t maximum_count_;
-@@ -519,6 +590,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
+@@ -519,6 +599,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
        // Free to be acquired by another thread
        if (count_ == 0) {
          cond_.notify_all();
@@ -2986,7 +2995,7 @@ index 9ac8d15..e2c0e6c 100644
        }
        return true;
      }
-@@ -551,6 +623,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
+@@ -551,6 +632,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
      std::lock_guard<std::mutex> lock(mutex_);
      signal_ = true;
      cond_.notify_all();
@@ -2994,7 +3003,7 @@ index 9ac8d15..e2c0e6c 100644
      return true;
    }
  
-@@ -979,6 +1052,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -979,6 +1061,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
        exit_code_ = exit_code;
        signaled_ = true;
        cond_.notify_all();
@@ -3002,7 +3011,7 @@ index 9ac8d15..e2c0e6c 100644
      }
      if (is_current_thread) {
        pthread_exit(reinterpret_cast<void*>(exit_code));
-@@ -1106,11 +1180,15 @@ std::chrono::milliseconds ComputeAlertableWaitTimeout(
+@@ -1106,11 +1189,15 @@ std::chrono::milliseconds ComputeAlertableWaitTimeout(
    if (deadline == std::chrono::steady_clock::time_point::max()) {
      return kAlertablePollSlice;
    }
@@ -3021,7 +3030,7 @@ index 9ac8d15..e2c0e6c 100644
    return std::min(remaining, kAlertablePollSlice);
  }
  
-@@ -1405,6 +1483,30 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1405,6 +1492,30 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
    }
  #endif
    set_current_thread_name("");
@@ -3052,7 +3061,7 @@ index 9ac8d15..e2c0e6c 100644
  
    auto start_data = static_cast<ThreadStartData*>(parameter);
    assert_not_null(start_data);
-@@ -1449,6 +1551,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1449,6 +1560,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
      thread->handle_.exit_code_ = 0;
      thread->handle_.signaled_ = true;
      thread->handle_.cond_.notify_all();
