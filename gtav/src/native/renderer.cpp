@@ -1836,30 +1836,50 @@ class Renderer {
   int ab_phase_ = -1;  // -1: off or warming up
   int ab_slot_phase_[Backend::kFramesInFlight] = {-1, -1};
   std::string ab_spec_, ab_name_, ab_values_[2];
+  struct AbMore {
+    std::string name, values[2];
+  };
+  std::vector<AbMore> ab_more_;  // further settings flipped with the first
   std::chrono::steady_clock::time_point ab_last_;
   uint64_t ab_frames_ = 0;
   double last_record_ms_ = 0, last_record_cpu_ms_ = 0, last_idle_ms_ = 0;
   void AbStep(uint64_t presented) {
     std::string spec = REXCVAR_GET(gtav_native_ab);
     if (spec != ab_spec_) {
+      for (const auto& more : ab_more_) rex::cvar::SetFlagByName(more.name, more.values[0]);
       if (!ab_name_.empty()) rex::cvar::SetFlagByName(ab_name_, ab_values_[0]);
       ab_spec_ = spec;
       ab_name_.clear();
+      ab_more_.clear();
       ab_[0] = ab_[1] = {};
       ab_frames_ = 0;
-      auto eq = spec.find('='), bar = spec.find('|');
-      if (eq != std::string::npos && bar != std::string::npos && bar > eq) {
-        ab_name_ = spec.substr(0, eq);
-        ab_values_[0] = spec.substr(eq + 1, bar - eq - 1);
-        ab_values_[1] = spec.substr(bar + 1);
-        REXLOG_INFO("[native] A/B {}: {} | {}", ab_name_, ab_values_[0], ab_values_[1]);
+      // "name=a|b", or several flipped together: "name=a|b;other=c|d" (the log line names the first).
+      size_t at = 0;
+      while (at < spec.size()) {
+        size_t end = spec.find(';', at);
+        if (end == std::string::npos) end = spec.size();
+        const std::string one = spec.substr(at, end - at);
+        at = end + 1;
+        auto eq = one.find('='), bar = one.find('|');
+        if (eq == std::string::npos || bar == std::string::npos || bar < eq) continue;
+        if (ab_name_.empty()) {
+          ab_name_ = one.substr(0, eq);
+          ab_values_[0] = one.substr(eq + 1, bar - eq - 1);
+          ab_values_[1] = one.substr(bar + 1);
+        } else {
+          ab_more_.push_back({one.substr(0, eq), {one.substr(eq + 1, bar - eq - 1), one.substr(bar + 1)}});
+        }
+        REXLOG_INFO("[native] A/B {}", one);
       }
     }
     ab_phase_ = -1;
     if (ab_name_.empty()) return;
     uint64_t k = ab_frames_++;
     int phase = int((k / 60) & 1);
-    if (k % 60 == 0) rex::cvar::SetFlagByName(ab_name_, ab_values_[phase]);
+    if (k % 60 == 0) {
+      rex::cvar::SetFlagByName(ab_name_, ab_values_[phase]);
+      for (const auto& more : ab_more_) rex::cvar::SetFlagByName(more.name, more.values[phase]);
+    }
     if (k % 60 >= 8) ab_phase_ = phase;
     ab_passes_before_ = plume::g_statRenderPasses;
     ab_barriers_before_ = plume::g_statBarriers;

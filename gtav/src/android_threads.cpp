@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <unordered_map>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -25,6 +26,16 @@
 // CPU). Checked every 250 ms, so it is live (--gtav_native_ab=gtav_android_main_prime=true|false).
 REXCVAR_DEFINE_BOOL(gtav_android_main_prime, true, "GTAV",
                     "Android: run the game's main thread on the prime core (the last CPU)");
+// The main thread sets the frame time, and it waits and wakes ~80 times a frame (for the game's
+// job threads): pinned to one core, every wake-up that finds another thread on that core waits for
+// the scheduler to move it away. Test: nothing else of the game may run there.
+REXCVAR_DEFINE_BOOL(gtav_android_prime_exclusive, false, "GTAV",
+                    "Android, with gtav_android_main_prime: keep the game's other threads off the prime core");
+// The job threads the main thread waits for are busy 10-17% each, in short bursts: the scheduler
+// keeps such threads on the little cores, where a job takes ~3x as long. Test: the game's own
+// threads (jobs, its render and audio threads) only on the upper half of the CPUs.
+REXCVAR_DEFINE_BOOL(gtav_android_guest_big, false, "GTAV",
+                    "Android: keep the game's own threads (XThread...) off the little cores");
 
 namespace {
 
@@ -33,6 +44,56 @@ bool SetAffinity(int tid, int first, int last) {
   CPU_ZERO(&set);
   for (int i = first; i <= last; i++) CPU_SET(i, &set);
   return sched_setaffinity(tid, sizeof(set), &set) == 0;
+}
+
+// Where the threads of the process other than `main` may run: the game's own threads on the
+// upper half of the CPUs (guest_big), nothing on the last one (exclusive). Only threads whose mask
+// was wide when first seen are managed, and only while their mask is still the one set here (the
+// renderer and the hash workers pin themselves).
+struct Managed {
+  uint32_t mask;
+  bool guest;
+};
+std::unordered_map<int, Managed> g_managed;  // pinner thread only
+
+void ApplyThreadPolicy(int main, int n, bool exclusive, bool guest_big) {
+  const uint32_t all = n >= 32 ? ~0u : (1u << n) - 1, prime = 1u << (n - 1);
+  const uint32_t upper = all & ~((1u << (n / 2)) - 1);
+  DIR* dir = opendir("/proc/self/task");
+  if (!dir) return;
+  while (dirent* e = readdir(dir)) {
+    if (e->d_name[0] == '.') continue;
+    const int tid = std::atoi(e->d_name);
+    if (!tid || tid == main) continue;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(tid, sizeof(set), &set) != 0) continue;
+    uint32_t now = 0;
+    for (int i = 0; i < n && i < 32; i++)
+      if (CPU_ISSET(i, &set)) now |= 1u << i;
+    auto it = g_managed.find(tid);
+    if (it == g_managed.end()) {
+      if (now != all) continue;  // pinned by its owner
+      char path[64], name[32] = {};
+      std::snprintf(path, sizeof(path), "/proc/self/task/%d/comm", tid);
+      if (FILE* f = std::fopen(path, "r")) {
+        size_t got = std::fread(name, 1, sizeof(name) - 1, f);
+        name[got] = 0;
+        std::fclose(f);
+      }
+      it = g_managed.emplace(tid, Managed{all, std::strncmp(name, "XThread", 7) == 0}).first;
+    } else if (now != it->second.mask) {
+      continue;  // changed by someone else since
+    }
+    uint32_t want = guest_big && it->second.guest ? upper : all;
+    if (exclusive) want &= ~prime;
+    if (want == now || !want) continue;
+    CPU_ZERO(&set);
+    for (int i = 0; i < n && i < 32; i++)
+      if (want & (1u << i)) CPU_SET(i, &set);
+    if (sched_setaffinity(tid, sizeof(set), &set) == 0) it->second.mask = want;
+  }
+  closedir(dir);
 }
 
 // The SDK names guest threads after their entry ("Main XThread (F8000...)").
@@ -63,11 +124,18 @@ const bool g_main_pinner = [] {
     const int n = int(sysconf(_SC_NPROCESSORS_CONF));
     if (n < 4) return;
     int tid = 0, pinned = -1;
+    bool policy = false;
     for (;;) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
       if (!tid) tid = FindMainThread();
       if (!tid) continue;
       const int want = REXCVAR_GET(gtav_android_main_prime) ? 1 : 0;
+      // (Every pass while one is on: threads come and go, and new ones inherit their creator's
+      // mask. One more pass after both went off puts the masks back.)
+      const bool exclusive = want && pinned == 1 && REXCVAR_GET(gtav_android_prime_exclusive);
+      const bool guest_big = REXCVAR_GET(gtav_android_guest_big);
+      if (exclusive || guest_big || policy) ApplyThreadPolicy(tid, n, exclusive, guest_big);
+      policy = exclusive || guest_big;
       if (want == pinned) continue;
       if (!(want ? SetAffinity(tid, n - 1, n - 1) : SetAffinity(tid, 0, n - 1))) {
         tid = 0;  // gone (or a new run of it): look it up again

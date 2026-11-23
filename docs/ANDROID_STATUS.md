@@ -11,6 +11,26 @@ GTA V runs in-game on a Galaxy S23 FE (Snapdragon 8 Gen 1, Adreno 730, Android 1
 letterboxed, with on-screen touch controls (a Bluetooth pad hides them). About 10-15 fps while the
 GPU is thermally throttled (350 of 818 MHz after long sessions on the charger).
 
+## Perf session 11-22: multithreaded recording built, phone not bound by it (branch `mt-record`)
+
+Full notes: `docs/HANDOFF_MT_RENDERER_2026-11-22.md`. `--gtav_native_record_workers=N` records a
+frame on N extra threads (off by default everywhere). On the S23 FE two workers cut recording
+29-32 -> 18-19 ms, and the frame got 1-2 ms *longer*: the renderer was not the limit.
+- Proof: `--gtav_native_ab=gtav_native_record_pad_ms=0|8` (8 ms added to every frame's recording):
+  frame 38.0 vs 38.0, 47.4 vs 46.6, 46.5 vs 46.0 ms. The A/B line's new `idle` column (render
+  thread waiting for the game's next frame) reads 5-13 ms on the phone.
+- The game's main thread sets the frame: it waits ~47% of the time in ~80 short waits a frame for
+  the game's job threads; the game's render thread waits on it 32%. The four fast cores are full
+  (renderer ~68% of one, audio thread ~59%, the game's render thread ~50%, command processor ~43%,
+  main thread, job threads).
+- Tried on top, all left off: workers on the little cores (too slow: recording becomes the limit,
+  27-32 fps against 30-37), with small chunks (neutral), nothing but the main thread on the prime
+  core (`gtav_android_prime_exclusive`, neutral), the game's threads off the little cores
+  (`gtav_android_guest_big`, worse).
+- What would move phone fps now: less CPU work in total on the fast cores (the renderer's vertex
+  hashing without a write watch ~10 ms a frame, the driver's ~10 ms of draw calls, the audio
+  thread), or a faster main thread. Not more threads.
+
 ## Perf session 10-30/31 (Mac arm64 work merged; measured on the phone, live A/B per change)
 
 Branch `android` (not pushed). Numbers: same-run `tools/android/ab.sh NAME 'cvar=a|b'` A/Bs.

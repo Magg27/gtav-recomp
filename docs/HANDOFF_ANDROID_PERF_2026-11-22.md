@@ -1,5 +1,15 @@
 # Handoff: Android performance rework (for a fresh Fable session)
 
+> **Correction, 2026-11-22 (later the same day, branch `mt-record`):** the rework below was built
+> (`docs/HANDOFF_MT_RENDERER_2026-11-22.md`), and it showed that this file's main claim is wrong:
+> **the phone's frame is not bound by the render thread's recording.** Adding 8 ms to every
+> frame's recording (`--gtav_native_ab=gtav_native_record_pad_ms=0|8`) left the frame time where
+> it was (38.0 vs 38.0, 47.4 vs 46.6, 46.5 vs 46.0 ms); the render thread idles 5-13 ms a frame
+> waiting for the game. Two record workers cut recording from ~31 to ~18 ms and fps did not move.
+> What sets the frame is the game's own threads: the main thread waits ~47% of the time on the
+> game's job threads, and the 3 mid + 1 prime cores are full. Read "What limits the phone frame"
+> below with that in mind (the fence wait is real but not on the critical path).
+
 Written 2026-11-22 at the end of the v0.5.0 / Android perf session. Owner's words: "get the android
 perf working as well as possible so the game runs super fast"; owner chose **"Do the big rework"**
 (parallel draw recording) and asked for it to be done in a fresh Fable session. Read this whole
