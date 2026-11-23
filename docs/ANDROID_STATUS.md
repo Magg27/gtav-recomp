@@ -75,9 +75,10 @@ about 35% fewer instructions on the job threads. The main and render threads spi
 so their counts include waiting and understate the gain. The audio mixer executes about 18% fewer
 instructions a second but nearly the same cycles (809-843 against 818-897 M a second): its time is
 not in instruction count. An earlier series the same morning (CPU time only) gave A 24.5 and 25.3
-fps, B 40.6 (and 56.9 from a cold phone at 1,077 draws). No crash in five B runs.
+fps, B 40.6 (and 56.9 from a cold phone at 1,077 draws). No crash in any B run (five short ones, the
+12-minute session below, and the GPU-side runs after it).
 
-Two things changed with it:
+Two things changed with B:
 - The clock caps: in every pair the B run got looser CPU caps than the A runs next to it, at the
   same or a higher thermal status. Less CPU work a frame leaves the CPU clusters cooler; the B runs
   heat the battery faster all the same (37.8 -> 44.5-44.8 C against 41.4-41.8 C in 190 s), because
@@ -87,12 +88,167 @@ Two things changed with it:
   which did not move fps while the game's code set the frame (render scale, load-op clears, coarse
   shading: all "no gain" on 10-31 and 11-22), are worth measuring again.
 
+Heat-soaked, one 12-minute session per library from the same battery temperature (36.8 C), a 40 s
+window every 150 s (`logs/android/mpL_longprobe.out`):
+
+| window | A fps | A draws | A battery C | A caps mid / prime GHz | A GPU idle ms | B fps | B draws | B battery C | B caps mid / prime GHz | B GPU idle ms |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 24.4 | 2,477 | 41.4 | 1.44-1.21 / 1.73-1.50 | 10.7 | 47.0 | 1,676 | 44.9 | 2.34-1.56 / 2.73-1.84 | 5.5 |
+| 2 | 22.0 | 2,616 | 42.1 | 1.21 / 1.40 | 14.7 | 29.1 | 2,958 | 45.1 | 1.32 / 1.61 | 3.6 |
+| 3 | 23.1 | 2,830 | 42.8 | 1.21 / 1.40 | 9.7 | 35.8 | 1,046 | 45.4 | 1.32 / 1.61 | 0.9 |
+| 4 | 21.8 | 2,742 | 43.2 | 1.21 / 1.40 | 15.9 | 34.9 | 1,065 | 45.6 | 1.32 / 1.61 | 1.0 |
+| 5 | 23.8 | 1,619 | 43.5 | 1.21 / 1.40 | 13.9 | 42.0 | 732 | 45.7 | 1.32-1.21 / 1.61-1.50 | 1.1 |
+
+A stays at 22-24 fps whatever is on screen (window 5: 1,619 draws, still 23.8 fps), so its frame
+is the game's code. B holds 29 fps in the one heavy window and 35-42 in the lighter ones, where the
+GPU has no idle time left and the record thread waits 7-14 ms a frame for a free frame slot. B ends
+2.2 C hotter (thermal status 3 against 2) and still keeps looser CPU caps. In windows 3 and 4 B's
+main thread executes 84 M instructions a frame against 20-25 M elsewhere: it polls while the GPU
+finishes, on a prime core.
+
+What limits B, measured the same morning (same-run A/Bs with `tools/android/ab.sh`, 4 minutes each
+from 41.8 C, a | b fps in the in-world windows, heaviest scenes 2,300-3,000 draws):
+- The GPU's clock is heat-capped: `/sys/class/kgsl/kgsl-3d0/thermal_pwrlevel` 10 = 285 MHz of 818
+  at thermal status 3 (skin 44.8 C), 492 MHz at 44.0 C, 545 MHz at the start of a run. GPU frame
+  22-33 ms at 285 MHz. Heat is the budget; every milliwatt the CPU side wastes is GPU clock.
+- GPU ms per frame by pass kind (`--gtav_native_pass_gpu_times=true`, 2,280 draws, 150 passes,
+  35 ms with the timestamps in): nine full-size colour+depth passes 5.5, G-buffer 5.4 in 5 passes,
+  shadow map (906 draws) 4.6, reflection cube (6 multisampled faces, 343 draws) 3.7, all resolve
+  copies together 4.6, nothing else above 1.7.
+- Skipping every colour resolve copy (`gtav_native_skip_resolves=1`, wrong picture, the upper bound
+  of what resolve work costs): 38.4 | 40.0, 33.5 | 34.0, 27.7 | 29.5, 28.4 | 30.3, 32.5 | 31.9.
+  GPU 3-4 ms less. Resolve copies are not the lever.
+- Clears as load operations (`gtav_native_load_clears`): 39.0 | 37.9, 36.5 | 37.5, 33.6 | 32.1,
+  30.8 | 30.5, 28.9 | 28.2. Nothing, as before. Off.
+- 2x2 coarse shading (`gtav_native_coarse_shading=2`): 27.4 | 28.1, 28.3 | 28.8, 26.3 | 26.8,
+  26.4 | 27.3, 25.7 | 27.1. GPU 2-3 ms less, 2-5% fps, for a softer picture. Off.
+- One record worker (`gtav_native_record_workers=1`): 35.2 | 36.6, 30.3 | 30.5, 28.5 | 28.5,
+  28.2 | 28.7, 28.4 | 27.6. Recording 25-30 -> 18-22 ms, and all of it becomes record-thread idle
+  time (1 -> 5-12 ms): in these scenes the record thread and the GPU were both at the frame
+  (record 30 of 35 ms, GPU 32), and with the worker the GPU alone is. Off: no fps, one more core.
+
 Linux (i5-13420H, GPU shared with another job, so `--gtav_native_render_scale=0.25` to let the
 CPU side set the frame): 14 standing runs, old binary against max-perf. At equal draws the game's
 threads use roughly 5-9% less CPU a frame; fps is inside the run-to-run spread (about 10% here).
 The record thread, whose code did not change, drifted 4-6% the same way, so the real figure is at
 the low end. The game's code does not set the frame on this laptop. Flush-to-zero against
 denormals kept: no difference in two runs. 5-minute run-around soaks: clean on both builds of it.
+
+Second batch, same day (the heat budget):
+- **D3D's fence wait sleeps instead of spinning** (`gtav_fence_block_after_us`, 200 on Linux and
+  Android, `gtav/src/gpu_fence_wait.cpp`). The game's main thread waits for the GPU inside D3D
+  (8380CEF8), which loops on a spin step (83807DC8) with no kernel call. With the GPU as the slower
+  side that is a core at full clock doing nothing: 66% of the main thread in a Linux profile, the
+  84 M instructions a frame above. The spin step is hooked: after 200 us of a wait it sleeps until
+  the renderer writes the fence (`capture.cpp` calls `gtav::FenceWritten()` at both writes), 2 ms
+  at most at a time, then runs the game's step. Same-run A/B on the phone, spin | sleep:
+  32.4 | 32.8, 36.8 | 37.2, 32.4 | 32.2, 30.1 | 29.6, 31.8 | 31.5, 30.6 | 30.5 fps. Linux: main
+  thread 97% -> 41% of a core at full size, fps equal there and at quarter size.
+  One 8-minute session each on the phone (`tools/android/lib_ab.sh mpb2f - A B`, spin first):
+
+  | window | spin fps | draws | status | caps mid / prime GHz | GPU cap MHz | main M instr | sleep fps | draws | status | caps mid / prime GHz | GPU cap MHz | main M instr |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | 1 | 32.4 | 2,321 | 2 | 1.65-1.44 / 1.96-1.73 | 421 | (not counted) | 26.8 | 2,577 | 2 | 1.21 / 1.40 | 285 | 16.8 |
+  | 2 | 26.1 | 2,598 | 3 | 1.32-1.21 / 1.61-1.50 | 350 | 21.1 | 27.9 | 2,422 | 2 | 1.21 / 1.40 | 285 | 15.7 |
+  | 3 | 23.4 | 2,747 | 3 | 1.00 / 1.17 | 220 | 46.8 | 27.8 | 2,721 | 2 | 1.32-1.21 / 1.61-1.50 | 317 | 15.9 |
+
+  Not a clean pair: the second session started from the same battery temperature (39.9 C) but a
+  warmer phone, so its first window is already capped. What it shows: the spinning session slides
+  to status 3 and a 220 MHz GPU (23.4 fps), the sleeping one stays at status 2 and 27-28 fps at the
+  same battery temperature (45.2 | 45.3 C) and the same draws. One pair, order not reversed.
+- **The D3D call-count probes are compiled out on Linux and Android** (`GTAV_D3D_PROBES`, CMake):
+  `d3d_probe.cpp` hooked all 2,888 functions of the D3D runtime, so with the separately built game
+  library each of those calls left the library and came back (two PLT jumps and the probe's test).
+  The game library now imports 55 hooks instead of 2,935. The render thread's instruction count at
+  equal draws is within the spread of the runs (0 to -5%): not resolvable, kept because it is free.
+  **The shell and the game library must match again**: a library built against the old hook list
+  does not load with the new shell (`files/libgtav_game.so.phonebuilt` on the test phone is such
+  a library; the setup screen rebuilds).
+- `tools/android/lib_ab.sh` can now compare two sets of flags across boots (B_LIBRARY `-`,
+  `EXTRA_A` / `EXTRA_B`) and prints the GPU's thermal clock cap and the net battery current
+  (`dumpsys battery`, "current now") of each window. The current only says something while it is
+  negative (the phone drawing more than USB delivers).
+- **Long Sleep(0) polls nap** (SDK, `guest_poll_patience_us`, 300 on Android; `guest_poll_nap_us`
+  100). With the fence wait asleep the main thread still spent a quarter of a core in the kernel:
+  its Sleep(0) poll loops (`XThread::Delay` -> `sched_yield`). A loop that has polled for 300 us
+  without a pause (calls at most 50 us apart) now sleeps 100 us between polls. Per-thread CPU
+  from `/proc` over two 47 s windows each (`lib_ab.sh mpb3n`): main thread kernel time 25.4 and
+  28.9% of a core with plain yields, 14.0 and 13.1% with the nap (user time 36-40% either way);
+  all threads' kernel time 99-107% -> 80-87%. Same-run A/B, yield | nap: 37.2 | 36.0, 36.9 | 37.0,
+  33.0 | 33.4, 31.5 | 31.8, 30.2 | 30.4, 30.2 | 30.3 fps (and with a 1,000 us patience: 28.1 | 28.1,
+  46.6 | 45.1, 36.6 | 34.6, 26.1 | 26.1, 25.6 | 25.1). Linux keeps plain yields (no CPU difference
+  measured there; a yield that finds nobody waiting costs well under a microsecond on x86).
+- Tried on the phone with this build, no change, left off or removed:
+  - `gtav_native_fence_wait_draw` (fences released per draw instead of per frame): 27.2 | 27.3,
+    33.2 | 33.4, 38.4 | 37.7, 32.8 | 32.2, 34.3 | 34.1, 31.5 | 31.6 fps.
+  - Render passes that cover only the drawn area (an experiment in plume, removed again; with
+    `gtav_native_load_clears`): the host targets are EDRAM-shaped (a 160x720 multisampled target
+    for the 128x128 cube faces, 1280x721 for the 720 rows of the scene), so all but one of the
+    game's ~22 clears a frame were "partial" and never became load ops. With the pass area
+    following the scissor, 14-22 of them do and 38-66 of ~155 passes get a smaller area, none
+    restarted. 30.0 | 29.6, 27.1 | 26.9, 28.6 | 28.6, 27.4 | 27.1, 28.9 | 28.6, 28.9 | 28.7 fps, GPU
+    28.94 | 29.12, 34.46 | 34.14, 33.22 | 33.13, 34.42 | 34.30, 33.16 | 33.16, 33.30 | 32.87 ms; same
+    picture (`ab_shots_diff.py`, 0 of 30 pairs out of range). Adreno does not spend time on the
+    tiles nothing is drawn into, and loading the drawn ones is not what costs. Linux (NVIDIA,
+    two 5-minute A/Bs): 36.2 | 34.3, 28.2 | 27.5, 25.7 | 26.6, 26.7 | 26.4, 28.5 | 25.3 fps, nothing
+    there either.
+
+Third batch, same day:
+- **The game's interlocked operations no longer take the runtime's global lock**
+  (`gtav_guest_irq_lock`, 0 on Linux and Android, `gtav/src/guest_irq_lock.cpp`). The 360's inline
+  `Interlocked*` code switches interrupts off around its load-reserve / store-conditional pair
+  (`mfmsr; mtmsrd r13; lwarx; ...; stwcx.; mtmsrd`), and the runtime maps "interrupts off" to its
+  one global recursive mutex. So every reference count and counter update of every game thread
+  queued for the same lock, about a million times a second: 5.5% of the process's CPU samples in
+  the phone profile (a quarter of a core), most of it kernel time, since a thread that finds the
+  lock taken sleeps for a section a few instructions long. Even asking "are interrupts on" took
+  and released the lock.
+  GTA V has 1,309 such sections (counted in the generated code). 1,308 are a load, register
+  arithmetic and a store-conditional: exchange 424, add 778, compare-exchange 93, and/or 13. The
+  generated store-conditional is a host compare-and-swap against the value the load read, atomic by
+  itself, and nothing in between reads shared memory, so these need no lock. The last one is split
+  over a helper pair (83829CC0 / 83829CD8) used by the pop and push of a lock-free pool's free list whose
+  head is {first node, depth}: the pop reads the first node's link between the two calls and
+  relies on the reservation, which a compare-and-swap does not emulate (a pop + push in between
+  gives the same head value with another link). That pair keeps the global lock, through two
+  hooks, so pool operations exclude each other as before.
+  The shell and the game library must match again (57 hooks). With the game code inside the
+  executable (the Linux dev build) the same switch is a build define, `REX_GUEST_IRQ_LOCK=0`, read
+  by the generated `gtav_pch.h` (SDK template).
+  Same-run A/B on the phone, lock | no lock: 40.0 | 42.1, 45.0 | 46.0, 46.4 | 50.7, 50.4 | 51.2,
+  43.3 | 44.4 fps while the GPU clock was still 420-545 MHz, then 37.4 | 37.8, 41.8 | 41.1,
+  44.5 | 44.9, 43.1 | 43.0, 43.0 | 43.2 once it was capped at 285-350 (the GPU sets the frame
+  there). CPU over four alternating boots (lock, none, lock, none; `lib_ab.sh mpb7_glx - A B A B`,
+  user + kernel % of a core from the thread snapshots): the 018xx job pool 76+24 | 59+8 and
+  58+22 | 52+9, all threads' kernel time 91 | 59 and 85 | 69, all threads 5.54 | 4.82 and
+  5.62 | 5.20 cores busy (the no-lock boots at lower CPU clocks, 1.34 and 1.30 against 1.50 and
+  1.59 GHz mean on the mid cores), net battery current -652 | -276 and -564 | -271 mA.
+  The fps of those four windows does not follow: 32.4 | 28.9 and 33.5 | 33.7 at 2,479 | 2,560
+  and 2,677 | 2,212 draws. With the lock the GPU sat idle 7-9 ms of every frame waiting for the
+  game (and stayed at thermal status 2 with a 350 MHz cap); without it the GPU works the whole
+  frame, the phone reaches status 3 during the warm-up and the window is measured at a 285 MHz
+  cap. Profile with the new defaults (`mpb7_prof`): the three lock calls 0.2% of the process's
+  samples (were 3.9), mutex lock + unlock 0.5% (5.6), all `syscall` time 6.9% (11.0), the 018xx
+  job pool 57% of a core (71).
+  Linux at quarter size, same scene (2,035 draws), old | new binary: the four job threads
+  56.3 | 38.1 and 59.4 | 35.2 % of a core, main thread 46.5 | 43.9 and 54.4 | 44.3, fps 54.6 | 62.1
+  and 58.9 (1,721 draws) | 59.7.
+- **Colour resolves between two textures of the same host format are image copies**
+  (`gtav_native_copy_resolves`, on for Android). 44-46 of the ~64 resolves of an open-world frame
+  were a render pass with one full-rectangle draw that loads each texel and stores it; they are
+  `vkCmdCopyImage` now (not the multisampled ones, the depth ones, or those that convert 7e3).
+  The record thread spent 15% of its time in resolves on the phone, and a third of the driver's
+  allocations came from their draws. Same-run A/B, drawn | copied: 44.1 | 45.3, 47.8 | 47.8,
+  45.9 | 46.3, 40.8 | 41.6, 42.5 | 42.2, 38.8 | 39.4, 33.5 | 34.3, 31.7 | 32.8, 31.2 | 31.8 fps; GPU
+  27.5 | 26.6, 30.0 | 28.9, 30.0 | 29.4 ms in the last three. Same picture (`ab_shots_diff.py`,
+  0 of 39 pairs out of range). In the profile after it the record thread's resolves are 10.8%
+  (were 15.3), `vkCmdBeginRenderPass` 4.4% (6.8), the driver's `calloc` 4.4% (7.0). Linux
+  (NVIDIA): 46 fewer passes a frame, fps and record time within the noise (30.8 | 29.4,
+  26.1 | 23.6, 30.5 | 34.0, 33.2 | 31.2), same picture (no in-world pair out of range); left off
+  there.
+- Measured the same way and dropped: a lock-free "are interrupts on" test plus 200 tries before a
+  waiting thread sleeps, still with the global lock (38.0 | 38.4, 42.3 | 44.8, 31.4 | 30.7,
+  30.5 | 31.6, 28.7 | 28.9, 27.3 | 27.2, 27.0 | 26.9 fps): superseded by not taking the lock.
 
 ## Perf session 11-23: the game's CPU side (branch `android-cpu`, off `mt-record`)
 

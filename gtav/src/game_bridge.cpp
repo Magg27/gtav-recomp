@@ -16,6 +16,7 @@
 #include <string_view>
 
 #include "../fs/layout_check.h"
+#include "guest_irq_lock.h"
 
 #ifdef _WIN32
 #define GTAVFS_EXPORT __declspec(dllexport)
@@ -25,8 +26,17 @@
 #endif
 
 namespace {
-std::atomic<int32_t> g_global_lock_count{0};
-}
+// "Interrupts off" sections of the guest (guest_irq_lock.cpp). The test answers "is this thread
+// inside one": with the global lock held, the count the old code read under that lock was the
+// calling thread's own depth, so the depth alone gives the same answer.
+thread_local int32_t t_irq_depth = 0;   // sections this thread is inside
+thread_local int32_t t_irq_locked = 0;  // of those, entered with the runtime's global lock
+// --gtav_guest_irq_lock as this thread last read it (every 64th test: reading a setting from
+// another module is a call, and these run about a million times a second). Every section starts
+// with the test.
+thread_local int32_t t_irq_mode = 1;
+thread_local uint32_t t_irq_tests = 0;
+}  // namespace
 
 extern "C" {
 
@@ -49,18 +59,29 @@ GTAVFS_EXPORT PPCFunc* gtavfs_resolve_indirect(uint32_t guest_address) {
 }
 
 GTAVFS_EXPORT void gtavfs_global_lock_enter() {
-  rex::thread::global_critical_region::mutex().lock();
-  g_global_lock_count.fetch_add(1);
+  if (t_irq_mode != 0) [[unlikely]] {
+    rex::thread::global_critical_region::mutex().lock();
+    t_irq_locked++;
+  }
+  t_irq_depth++;
 }
 
 GTAVFS_EXPORT void gtavfs_global_lock_leave() {
-  g_global_lock_count.fetch_sub(1);
-  rex::thread::global_critical_region::mutex().unlock();
+  t_irq_depth--;
+  if (t_irq_locked) [[unlikely]] {  // (not the mode: it may have changed since the enter)
+    t_irq_locked--;
+    rex::thread::global_critical_region::mutex().unlock();
+  }
 }
 
 GTAVFS_EXPORT uint64_t gtavfs_global_lock_check() {
-  auto lock = rex::thread::global_critical_region::AcquireDirect();
-  return g_global_lock_count.load() ? 0 : 0x8000;
+  if ((t_irq_tests++ & 63) == 0) t_irq_mode = gtav::GuestIrqLockMode();
+  if (t_irq_mode == 2) [[unlikely]] {
+    // As before 11-23: wait for whoever is inside a section, then answer.
+    auto lock = rex::thread::global_critical_region::AcquireDirect();
+    return t_irq_depth ? 0 : 0x8000;
+  }
+  return t_irq_depth ? 0 : 0x8000;
 }
 
 GTAVFS_EXPORT void gtavfs_trap(PPCContext* ctx, uint8_t* base, uint16_t trap_type) {

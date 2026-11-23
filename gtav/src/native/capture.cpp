@@ -26,6 +26,7 @@
 #include <xxhash.h>
 
 #include "safe_read.h"
+#include "../gpu_fence_wait.h"
 #include "../linux_threads.h"
 #ifndef _WIN32
 #include <unistd.h>
@@ -1334,6 +1335,7 @@ void FenceFlush() {
   g_fence_written = g_fence_latest;
   FenceReached(g_fence_written);
   StoreFence(address & 0x1FFFFFFF, g_fence_written, g_fence_endian);
+  gtav::FenceWritten();
 }
 }  // namespace gtav::native
 
@@ -1355,6 +1357,10 @@ extern "C" GTAV_HOOK_EXPORT uint32_t rex_skip_rendering_fence(uint32_t address, 
   if (!g_fence_any || int32_t(target - g_fence_written) > 0) g_fence_written = target;
   g_fence_any = true;
   FenceReached(g_fence_written);
+  // Stored here as well (the command processor stores the returned value again, on this same
+  // thread), so that the threads sleeping in D3D's fence wait are woken after the value is there.
+  StoreFence(address & 0x1FFFFFFF, g_fence_written, endian);
+  gtav::FenceWritten();
   return g_fence_written;
 }
 

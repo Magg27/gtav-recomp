@@ -68,7 +68,7 @@ bool SafeRead32(const uint8_t* base, uint32_t addr, uint32_t* out) {
 Probe g_probes[GTAV_PROBE_COUNT];
 std::atomic<uint64_t> g_frames{0};
 
-void Hit(int index, uint32_t addr, PPCContext& ctx, const uint8_t* base) {
+[[maybe_unused]] void Hit(int index, uint32_t addr, PPCContext& ctx, const uint8_t* base) {
   Probe& p = g_probes[index];
   p.addr = addr;
   p.calls.fetch_add(1, std::memory_order_relaxed);
@@ -130,6 +130,9 @@ void gtav::native::ProbeFrame() {
   }
 }
 
+// Built only with -DGTAV_D3D_PROBES=ON (CMakeLists.txt): without it --gtav_d3d_probe counts nothing
+// and the game's D3D calls stay inside the game library.
+#if GTAV_D3D_PROBES
 #define GTAV_PROBE(addr, index)                                  \
   REX_EXTERN(__imp__sub_##addr);                                 \
   REX_HOOK_RAW(sub_##addr) {                                     \
@@ -138,3 +141,4 @@ void gtav::native::ProbeFrame() {
   }
 #include "d3d_probe_list.inc"
 #undef GTAV_PROBE
+#endif

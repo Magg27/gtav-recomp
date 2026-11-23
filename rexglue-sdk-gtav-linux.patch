@@ -613,6 +613,19 @@ index 0a43f07..ea9bb29 100644
    }
  
    static uint32_t TimeoutTicksToMs(int64_t timeout_ticks);
+diff --git a/include/rex/system/xthread.h b/include/rex/system/xthread.h
+index a72911e..233ad76 100644
+--- a/include/rex/system/xthread.h
++++ b/include/rex/system/xthread.h
+@@ -426,6 +426,8 @@ class XThread : public XObject {
+   std::unique_ptr<runtime::ThreadState> thread_state_;
+ 
+   int32_t priority_ = 0;
++  uint64_t poll_start_ns_ = 0;  // Sleep(0) poll loop in progress: when it began, and its last call
++  uint64_t poll_last_ns_ = 0;
+ 
+ #if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+   std::mutex suspend_mutex_;
 diff --git a/include/rex/thread/fiber.h b/include/rex/thread/fiber.h
 index 352af67..2f6123f 100644
 --- a/include/rex/thread/fiber.h
@@ -685,7 +698,7 @@ index 50638d6..feec200 100644
  namespace rex {
  namespace ui {
 diff --git a/resources/templates/codegen/pch_h.inja b/resources/templates/codegen/pch_h.inja
-index 68274d2..610fab2 100644
+index 68274d2..acc14cf 100644
 --- a/resources/templates/codegen/pch_h.inja
 +++ b/resources/templates/codegen/pch_h.inja
 @@ -262,6 +262,12 @@ extern PPCFuncMapping PPCFuncMappings[];
@@ -701,6 +714,62 @@ index 68274d2..610fab2 100644
  //=============================================================================
  // Setjmp/Longjmp
  //=============================================================================
+@@ -310,26 +316,44 @@ inline void ppc_trap(PPCContext& ctx, u8* base, u16 trap_type) {
+ // Interrupt Locks
+ //=============================================================================
+ 
+-inline std::atomic<i32>& ppc_global_lock_count_() {
+-  static std::atomic<i32> count{0};
+-  return count;
++// mfmsr rX / mtmsrd r13 ... mtmsrd rX: the guest switches interrupts off around a few instructions.
++// The check answers "is this thread inside such a section": a per-thread depth (with the global
++// lock held, the count the old code read under that lock was the calling thread's own depth).
++//
++// By default a section holds the runtime's global lock. A game whose sections are all single
++// lwarx/stwcx. (ldarx/stdcx.) sequences with register arithmetic in between - the 360's inline
++// interlocked operations - can build its generated code with REX_GUEST_IRQ_LOCK=0: the host
++// compare-and-swap of stwcx. is atomic by itself, and the lock only made every interlocked
++// operation of every thread queue for one mutex. A section that reads other shared memory between
++// the load and the store (a list pop) relies on the reservation and still needs a lock: the game
++// has to give those their own (hooks).
++
++inline i32& ppc_irq_depth_() {
++  static thread_local i32 depth = 0;
++  return depth;
+ }
+ 
+-#define REX_CHECK_GLOBAL_LOCK()                                        \
+-  ([&]() -> u64 {                                                      \
+-    auto lock_ = rex::thread::global_critical_region::AcquireDirect(); \
+-    return ppc_global_lock_count_().load() ? 0 : 0x8000;               \
+-  }())
++#define REX_CHECK_GLOBAL_LOCK() (ppc_irq_depth_() ? u64(0) : u64(0x8000))
++
++#if defined(REX_GUEST_IRQ_LOCK) && !REX_GUEST_IRQ_LOCK
++
++#define REX_ENTER_GLOBAL_LOCK() ((void)++ppc_irq_depth_())
++
++#define REX_LEAVE_GLOBAL_LOCK() ((void)--ppc_irq_depth_())
++
++#else
+ 
+ #define REX_ENTER_GLOBAL_LOCK()                          \
+   do {                                                   \
+     rex::thread::global_critical_region::mutex().lock(); \
+-    ppc_global_lock_count_().fetch_add(1);               \
++    ++ppc_irq_depth_();                                  \
+   } while (0)
+ 
+ #define REX_LEAVE_GLOBAL_LOCK()                                                           \
+   do {                                                                                    \
+-    auto old_count_ = ppc_global_lock_count_().fetch_sub(1);                              \
+-    assert(old_count_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
++    auto old_depth_ = ppc_irq_depth_()--;                                                 \
++    assert(old_depth_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
+     rex::thread::global_critical_region::mutex().unlock();                                \
+   } while (0)
++
++#endif
 diff --git a/resources/templates/test/ppc_config_h.inja b/resources/templates/test/ppc_config_h.inja
 index 0c334f8..8a62c96 100644
 --- a/resources/templates/test/ppc_config_h.inja
@@ -4988,10 +5057,10 @@ index db830e4..f053f2a 100644
    bool success = semaphore_->Release(release_count, &previous_count);
    if (out_previous_count) {
 diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
-index 77bce25..bb7c663 100644
+index 77bce25..2669718 100644
 --- a/src/system/xthread.cpp
 +++ b/src/system/xthread.cpp
-@@ -37,6 +37,21 @@
+@@ -37,6 +37,41 @@
  #include <rex/thread.h>
  #include <rex/vec128.h>
  
@@ -5010,10 +5079,30 @@ index 77bce25..bb7c663 100644
 +                    "Guest threads start with denormals flushed to zero (single-FP-mode game builds stay in it)");
 +REXCVAR_DEFINE_INT32(guest_sleep_zero_us, 0, "Kernel",
 +                     "Guest Sleep(0): 0 = yield the core, N = sleep N microseconds (live)");
++// A guest thread that has polled with Sleep(0) for this long without a pause naps between polls
++// instead of yielding. GTA V's main thread polls for its job threads (waits well under a
++// millisecond: yielding is the fastest way to notice, see above) and, when the GPU sets the frame,
++// for the frame before (many milliseconds on a core at full clock, which on a phone is heat taken
++// from the GPU's and the other cores' budget). 0 = always yield.
++// S23 FE 11-23 (GPU-bound, D3D's fence wait already sleeping): the main thread's kernel time
++// 25-29% -> 13-14% of a core with 300 (user time 36-40% either way; all threads 99-107% -> 80-87%),
++// same-run A/B yield | 300: 37.2 | 36.0, 36.9 | 37.0, 33.0 | 33.4, 31.5 | 31.8, 30.2 | 30.4 fps
++// (and | 1000: 28.1 | 28.1, 46.6 | 45.1, 36.6 | 34.6, 26.1 | 26.1): on there. Linux x86 (a yield
++// that finds nobody waiting returns in well under a microsecond): no CPU difference measured,
++// quarter-size A/B 54.6 | 54.0 fps on average: off.
++#if REX_PLATFORM_ANDROID
++#define REX_GUEST_POLL_PATIENCE_DEFAULT 300
++#else
++#define REX_GUEST_POLL_PATIENCE_DEFAULT 0
++#endif
++REXCVAR_DEFINE_INT32(guest_poll_patience_us, REX_GUEST_POLL_PATIENCE_DEFAULT, "Kernel",
++                     "Guest Sleep(0) polling longer than N microseconds naps between polls (0 = off, live)");
++REXCVAR_DEFINE_INT32(guest_poll_nap_us, 100, "Kernel",
++                     "Length of those naps in microseconds (live)");
  REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
                      "Ignores game-specified thread priorities");
  
-@@ -183,6 +198,18 @@ void XThread::set_name(const std::string_view name) {
+@@ -183,6 +218,18 @@ void XThread::set_name(const std::string_view name) {
    }
  }
  
@@ -5032,7 +5121,7 @@ index 77bce25..bb7c663 100644
  static uint8_t next_cpu = 0;
  static uint8_t GetFakeCpuNumber(uint8_t proc_mask) {
    // NOTE: proc_mask is logical processors, not physical processors or cores.
-@@ -441,6 +468,7 @@ X_STATUS XThread::Create() {
+@@ -441,6 +488,7 @@ X_STATUS XThread::Create() {
  
      // Set name immediately, if we have one.
      thread_->set_name(thread_name_);
@@ -5040,7 +5129,7 @@ index 77bce25..bb7c663 100644
  
      PROFILE_THREAD_ENTER(thread_name_.c_str());
      PROFILE_THREAD_CREATED();
-@@ -470,7 +498,9 @@ X_STATUS XThread::Create() {
+@@ -470,7 +518,9 @@ X_STATUS XThread::Create() {
      set_name(fmt::format("XThread{:04X}", thread_->system_id()));
    }
  
@@ -5051,7 +5140,7 @@ index 77bce25..bb7c663 100644
      thread_->set_priority(creation_params_.creation_flags & 0x20 ? 1 : 0);
    }
  
-@@ -637,6 +667,7 @@ void XThread::Execute() {
+@@ -637,6 +687,7 @@ void XThread::Execute() {
      ctx->r10.u64 = args[7];
  
    ctx->fpscr.InitHost();
@@ -5059,7 +5148,7 @@ index 77bce25..bb7c663 100644
  
    // Convert this host thread to a fiber so SwitchTo works bidirectionally.
    // Required on Windows before any CreateFiber; provides the fallback handle
-@@ -856,6 +887,7 @@ void XThread::SetPriority(int32_t increment) {
+@@ -856,6 +907,7 @@ void XThread::SetPriority(int32_t increment) {
    if (!REXCVAR_GET(ignore_thread_priorities)) {
      thread_->set_priority(target_priority);
    }
@@ -5067,7 +5156,7 @@ index 77bce25..bb7c663 100644
  }
  
  void XThread::SetAffinity(uint32_t affinity) {
-@@ -901,6 +933,7 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
+@@ -901,6 +953,7 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
    } else {
      REXSYS_WARN("Too few processor cores - scheduling will be wonky");
    }
@@ -5075,7 +5164,7 @@ index 77bce25..bb7c663 100644
  }
  
  bool XThread::GetTLSValue(uint32_t slot, uint32_t* value_out) {
-@@ -1025,8 +1058,16 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
+@@ -1025,8 +1078,33 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
      }
    } else {
      if (timeout_ms == 0) {
@@ -5090,6 +5179,23 @@ index 77bce25..bb7c663 100644
          rex::thread::Sleep(std::chrono::microseconds(100));
 +      } else if (const int32_t us = REXCVAR_GET(guest_sleep_zero_us); us > 0) {
 +        rex::thread::Sleep(std::chrono::microseconds(us));
++      } else if (const int32_t patience = REXCVAR_GET(guest_poll_patience_us); patience > 0) {
++        // One poll loop = Sleep(0) calls at most 50 us apart (a longer gap is work, or a yield that
++        // gave the core to someone: a new wait starts).
++        const auto now_ns = [] {
++          return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                              std::chrono::steady_clock::now().time_since_epoch())
++                              .count());
++        };
++        const uint64_t now = now_ns();
++        if (now - poll_last_ns_ > 50'000) poll_start_ns_ = now;
++        poll_last_ns_ = now;
++        if (now - poll_start_ns_ > uint64_t(patience) * 1000) {
++          rex::thread::Sleep(std::chrono::microseconds(std::max(1, REXCVAR_GET(guest_poll_nap_us))));
++          poll_last_ns_ = now_ns();
++        } else {
++          rex::thread::MaybeYield();
++        }
        } else {
          rex::thread::MaybeYield();
        }

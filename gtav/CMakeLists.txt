@@ -70,6 +70,7 @@ set(GTAV_SOURCES
     src/frame_limit.cpp
     src/wait_profile.cpp
     src/gpu_fence_wait.cpp
+    src/guest_irq_lock.cpp
     src/linux_threads.cpp
     src/native/stats.cpp
     src/native/capture.cpp
@@ -251,9 +252,34 @@ if(GTAV_FP_SINGLE_MODE AND TARGET gtav_recomp AND NOT WIN32 AND NOT APPLE)
     target_compile_definitions(gtav_recomp PRIVATE REX_FP_SINGLE_MODE)
 endif()
 
+# The game's "interrupts off" sections are interlocked operations (src/guest_irq_lock.cpp): generated
+# code inside the executable skips the runtime's global lock for them (REX_GUEST_IRQ_LOCK in the
+# generated gtav_pch.h). A separately built game library asks the executable instead
+# (--gtav_guest_irq_lock). Linux and Android only (max-perf line).
+option(GTAV_GUEST_IRQ_NOLOCK "Generated code: interlocked operations without the global lock" ON)
+if(GTAV_GUEST_IRQ_NOLOCK AND NOT WIN32 AND NOT APPLE)
+    if(TARGET gtav_recomp)
+        target_compile_definitions(gtav_recomp PRIVATE REX_GUEST_IRQ_LOCK=0)
+    endif()
+    target_compile_definitions(gtav PRIVATE REX_GUEST_IRQ_LOCK=0)
+endif()
+
 # Dev builds: inline the __savegprlr/__restgprlr helpers into every generated function
 # (fs/gprlr_inline.h, +2.6% on the main thread 11-14). Off by default: it changes the release's
 # game code, which waits for the owner (after v0.4.0).
+# The call-count probes hook all 2,888 functions of the D3D runtime (src/native/d3d_probe.cpp, a
+# tool for naming them). With a separately built game library every one of those calls then leaves
+# the library and comes back (two PLT jumps and the probe's test). The max-performance line builds
+# without them on Linux and Android; -DGTAV_D3D_PROBES=ON brings the tool back.
+if(WIN32 OR APPLE)
+    option(GTAV_D3D_PROBES "Hook every D3D runtime function for --gtav_d3d_probe" ON)
+else()
+    option(GTAV_D3D_PROBES "Hook every D3D runtime function for --gtav_d3d_probe" OFF)
+endif()
+if(GTAV_D3D_PROBES)
+    target_compile_definitions(gtav PRIVATE GTAV_D3D_PROBES=1)
+endif()
+
 option(GTAV_GPRLR_INLINE "Inline the guest register save/restore helpers (dev builds)" OFF)
 if(GTAV_GPRLR_INLINE AND TARGET gtav_recomp AND NOT APPLE)
     if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")

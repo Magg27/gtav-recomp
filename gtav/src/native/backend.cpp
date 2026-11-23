@@ -287,6 +287,18 @@ REXCVAR_DEFINE_INT32(gtav_native_storage_max_texels, 640 * 360, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_compute_resolves, false, "GTAV",
                     "Tile GPUs (Metal): colour resolves as compute dispatches instead of a render pass each "
                     "(slower on the M1: storage usage on the resolve textures costs more than the passes it saves)");
+// S23 FE 11-23, same-run A/B, drawn | copied: 44.1 | 45.3, 47.8 | 47.8, 45.9 | 46.3, 40.8 | 41.6,
+// 42.5 | 42.2, 38.8 | 39.4, 33.5 | 34.3, 31.7 | 32.8, 31.2 | 31.8 fps (GPU 27.5 | 26.6, 30.0 | 28.9,
+// 30.0 | 29.4 ms in the last three): on there. Linux (NVIDIA): 46 fewer passes a frame, fps and
+// record time within the noise (30.8 | 29.4, 26.1 | 23.6, 30.5 | 34.0, 33.2 | 31.2): left off.
+#if defined(__ANDROID__)
+#define GTAV_COPY_RESOLVES_DEFAULT true
+#else
+#define GTAV_COPY_RESOLVES_DEFAULT false
+#endif
+REXCVAR_DEFINE_BOOL(gtav_native_copy_resolves, GTAV_COPY_RESOLVES_DEFAULT, "GTAV",
+                    "Native renderer: a colour resolve between two textures of the same host format is an image "
+                    "copy instead of a render pass with one draw (live)");
 REXCVAR_DEFINE_BOOL(gtav_native_hold_lost_frames, true, "GTAV",
                     "Show the previous frame again instead of a frame that lost draws to pipelines still "
                     "compiling");
@@ -6225,6 +6237,7 @@ struct Backend::Impl {
   std::unique_ptr<RenderShader> compute_resolve_cs;
   std::unique_ptr<RenderPipeline> compute_resolve_pipeline;
   uint32_t stat_compute_resolves = 0;
+  uint32_t stat_copy_resolves = 0;  // --gtav_native_copy_resolves: resolves done as image copies
   void ComputeResolve(RenderCommandList* list, RenderTarget* src, uint32_t src_descriptor, ResolvedTexture& dst,
                       uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2, uint32_t px, uint32_t py, float scale,
                       uint32_t mode) {
@@ -6485,6 +6498,31 @@ struct Backend::Impl {
     } else if (shader_copy && !depth_resolve && REXCVAR_GET(gtav_native_skip_resolves) > 0 &&
                (x2 - x1) * (y2 - y1) >= uint32_t(REXCVAR_GET(gtav_native_skip_resolves))) {
       // timing experiment only: the destination keeps stale contents
+    } else if (shader_copy && !depth_resolve && !src->msaa && src->format == dst_format && !dumping &&
+               REXCVAR_GET(gtav_native_copy_resolves) &&
+               !(IsFixed10(uint32_t(regs::Color(r, int(source)).format)) && src->float_data)) {
+      // Same host format and nothing to convert (the copy shader would load each texel and store
+      // it): an image copy. No render pass on the destination, no pipeline, descriptor sets or
+      // draw: on the S23 FE a resolve pass cost the record thread ~60 us, 44 of the 64 resolves of
+      // an open-world frame are of this kind.
+      const int32_t sx1 = Sc(int32_t(x1), s), sy1 = Sc(int32_t(y1), s), sx2 = Sc(int32_t(x2), s),
+                    sy2 = Sc(int32_t(y2), s), spx = Sc(int32_t(px), s), spy = Sc(int32_t(py), s);
+      const int32_t src_w = int32_t(Sz(src->width, s)), src_h = int32_t(Sz(src->height, s));
+      const int32_t dst_w = std::max(1, int32_t(Sz(dw, s)) >> rc.dest_level),
+                    dst_h = std::max(1, int32_t(Sz(dh, s)) >> rc.dest_level);
+      const int32_t w = std::min({sx2 - sx1, src_w - sx1, dst_w - spx}),
+                    h = std::min({sy2 - sy1, src_h - sy1, dst_h - spy});
+      if (w > 0 && h > 0) {
+        Transition(list, src->texture.get(), RenderTextureLayout::COPY_SOURCE);
+        Transition(list, dst.texture.get(), RenderTextureLayout::COPY_DEST);
+        if (pass_times) PassStamp(list, fmt::format("resolve image copy {}x{}", x2 - x1, y2 - y1));
+        pass_end = "resolve copy";
+        RenderBox box{sx1, sy1, sx1 + w, sy1 + h, 0, 1};
+        list->copyTextureRegion(RenderTextureCopyLocation::Subresource(dst.texture.get(), rc.dest_level, rc.dest_face),
+                                RenderTextureCopyLocation::Subresource(src->texture.get()), uint32_t(spx),
+                                uint32_t(spy), 0, &box);
+        stat_copy_resolves++;
+      }
     } else if (shader_copy) {
       if (src_descriptor == src->descriptor)
         Transition(list, src->texture.get(),
@@ -6825,6 +6863,8 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
       s.stat_fetch_restarted = 0;
       if (s.compute_resolves) REXLOG_INFO("[native]   compute resolves per frame: {:.1f}", s.stat_compute_resolves / n);
       s.stat_compute_resolves = 0;
+      if (s.stat_copy_resolves) REXLOG_INFO("[native]   resolves as image copies per frame: {:.1f}", s.stat_copy_resolves / n);
+      s.stat_copy_resolves = 0;
       {
         std::vector<std::pair<uint32_t, std::string>> v;
         for (auto& [k, c] : s.pass_reasons) v.emplace_back(c, k);
