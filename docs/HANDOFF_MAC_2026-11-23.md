@@ -276,4 +276,15 @@ Uploads to the draft `v0.5.0`:
   The Mac zip's `ios/` holds the same binaries with the ad-hoc signatures `make_release_macos.py`
   gives every Mach-O in the app, so they differ byte for byte from the tar's.
 
-Not done: the "After it passes" switches, PR #16.
+Two of the "After it passes" switches, measured on the Mac only (package build, existing save,
+hidden, uncapped; defaults **not** changed):
+
+| switch | frame rate | CPU |
+|---|---|---|
+| `gtav_guest_irq_lock` 1 -> 0 | +0.3% (9 A/B reports, 48-58 fps both sides) | not measured |
+| `gtav_fence_block_after_us` -1 -> 200 | +0.3% (9 A/B reports) | 4.6 -> 4.1 cores over 3 minutes in the world (one run each) |
+
+Neither crashed or changed the picture's draw counts in 4 minutes. On the Mac the lock mode
+makes no difference to the frame rate; blocking in the fence wait costs nothing and saves about
+half a core, as on Linux and Android. Not done: `REX_FP_SINGLE_MODE`, anything on the iPhone,
+PR #16.
