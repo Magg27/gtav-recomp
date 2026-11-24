@@ -285,6 +285,63 @@ Fourth batch, same day (SDK waits, from the profile taken after the third batch)
   the record thread, and ~5% in kernel calls for waking and parking job threads (~4,000 tiny jobs
   a second).
 
+Fifth batch, same day (where the GPU's time goes, thread placement, fewer render passes):
+- GPU ms per frame by kind of pass with the fourth batch's build
+  (`--gtav_native_pass_gpu_times=true`, `mpc1_pass`, 2,650-2,880 draws, GPU capped at 421 MHz,
+  25.4 ms with the timestamps in): the G-buffer fill (four colour targets + depth, 1280x721) 8.2
+  in 7 passes; the lit scene's target with depth 3.9 in 8.5 passes; the shadow map (640x2561, one
+  pass, ~1,000 draws) 2.5; the reflection cube (six multisampled 128x128 faces, ~345 draws) 2.3;
+  the first G-buffer target alone with depth 1.0 in 4.9 passes; full-size resolve copies 0.9;
+  640x720 depth-only 0.6; depth resolve copies 0.6; nothing else above 0.5.
+- No gain, same-run A/Bs: anisotropic filtering capped at 2 instead of 16
+  (`gtav_native_max_anisotropy`: 45.5 | 44.9, 47.4 | 47.3, 45.3 | 45.2, 40.9 | 40.4, 39.8 | 39.4,
+  38.4 | 38.4, 34.6 | 33.8 fps) and the top mip level skipped (`gtav_native_texture_min_lod=1`:
+  42.2 | 43.2, 42.5 | 42.2, 35.0 | 35.0, 31.9 | 32.1, 31.9 | 33.1). Both stay as they were.
+- **The record thread has the prime core, the main thread runs on the middle cores**
+  (`gtav_android_record_cores`, 3 by default now, live; `android_threads.cpp`). The record thread
+  is at the frame time in every thermal state and shared the three middle cores with the game's
+  render, audio and job threads, while the main thread, which waits for its jobs and for the GPU
+  about half of every frame, had the prime core to itself. Same-run A/B, middle cores | prime
+  core with the main thread on the middle cores (`mpc2_rc3`, GPU capped at 285-421 MHz):
+
+  | fps | recording ms | GPU ms | draws |
+  |---|---|---|---|
+  | 48.0 \| 49.1 | 17.7 \| 13.4 | 18.0 \| 17.9 | 1,662 \| 1,674 |
+  | 48.7 \| 51.2 | 16.9 \| 12.1 | 18.2 \| 17.9 | 1,593 \| 1,574 |
+  | 34.3 \| 34.0 | 25.1 \| 19.4 | 26.2 \| 27.5 | 2,385 \| 2,441 |
+  | 28.9 \| 30.2 | 29.3 \| 22.2 | 32.6 \| 32.0 | 2,751 \| 2,816 |
+  | 29.6 \| 30.6 | 30.3 \| 22.9 | 31.8 \| 31.7 | 2,876 \| 2,861 |
+  | 28.4 \| 29.3 | 31.1 \| 24.0 | 32.6 \| 32.9 | 2,893 \| 2,911 |
+
+  Recording takes 23-28% less time; fps moves 0-5% because the GPU is the other side at the
+  frame (its time is unchanged). The other placements are worse than the old one: the record
+  thread on the prime core next to the main thread (1) 29.5 | 26.1, 32.2 | 30.6, 34.1 | 30.0,
+  31.2 | 28.5, 27.4 | 25.1 fps (recording 25-31 -> 31-39 ms); the record thread free to use the
+  middle and the prime cores (2) 26.7 | 24.9, 39.1 | 40.3, 26.3 | 24.8, 35.9 | 32.7, 29.1 | 26.6.
+- **Draws into some of the bound targets keep the render pass** (`gtav_native_keep_targets`, live,
+  off until it is measured on the phone). The G-buffer fill alternates between its four colour
+  targets and the first one alone (the guest only changes its colour mask), and the lit scene
+  between colour + depth and colour alone; the renderer started a pass with the smaller set every
+  time. In a frame dumped on Linux (`GTAV_NATIVE_PASS_STATS=1 --gtav_native_seqdiag=1`) the
+  G-buffer is 443 draws into 4 targets, 69 into 1, 69 into 4, 8 into 1, 106 into 4, 1 into 3,
+  31 into 4: seven passes over the same five attachments, each a store and a load of all of
+  them on a tile GPU, and those seven passes are the 8.2 ms above. With the setting on such a
+  draw is recorded with the bound set and writes nothing to the rest (the colour mask of the
+  attachments it does not use is already 0, a draw without depth has its depth and stencil tests
+  off). Linux (NVIDIA), same-run A/B `mp_kt_ab`: 153 -> 144.5 passes a frame, same picture
+  (`ab_shots_diff.py`, 0 of 425 pairs out of range; in-world neighbours differ only where
+  something is animated), fps and recording time inside the noise there. **Not measured on the
+  phone yet** (it was not connected): `logs/phone_c3.sh` installs the build and runs the A/B, a
+  screenshot comparison, the GPU time by pass kind and the placement A/B again with the merge on.
+- The per-texture hash timers read the clock on the record profile's sampled frames only (every
+  8th): 800-2,500 pairs of clock reads a frame were 2.5% of the record thread in `mpb9_prof`.
+- Measured on Linux and removed: the count of recorded draws that the GPU fences wait on moved
+  every 8 draws instead of at every draw (the store was 3.9% of the record thread in the phone
+  profile: the game's GPU thread reads the same cache line at every fence). Record thread CPU
+  per draw 4.92 | 4.98 us over ten same-run windows (`mp_ps_ab`), and that run copied far more
+  draw data at fences (up to 37,900 draws, 1 GB, per 300 frames against 0-5,000 in the run
+  before it): a count that is behind makes fences wait or copy.
+
 ## Perf session 11-23: the game's CPU side (branch `android-cpu`, off `mt-record`)
 
 Owner: "let's get android running insanely fast, like how can we speed up the game cpu stuff?"

@@ -76,6 +76,17 @@ REXCVAR_DEFINE_INT32(gtav_android_job_cores, 0, "GTAV",
                      "2 the middle cores only (live)");
 
 std::atomic<int> gtav_android_render_tid{0};  // set by the game's render thread (capture.cpp)
+// The renderer's record thread replays every draw into Vulkan and is at the frame time in every
+// thermal state, on one of the three middle cores, which the game's render and audio threads and
+// the job threads fill as well, while the prime core is half idle under the main thread (it waits
+// for its jobs and for the GPU about half of every frame). Swapping the two (3) records a frame in
+// 23-28% less time on the S23 FE and costs the main thread nothing measurable; sharing the prime
+// core (1) or letting the record thread roam over both clusters (2) is 7-12% slower than 0.
+REXCVAR_DEFINE_INT32(gtav_android_record_cores, 3, "GTAV",
+                     "Android: where the renderer's record thread runs: 0 the middle cores, 1 the prime core "
+                     "(shared with the main thread), 2 the middle cores and the prime core, 3 the prime core "
+                     "with the main thread moved to the middle cores, whatever gtav_android_main_prime says (live)");
+std::atomic<int> gtav_android_record_tid{0};  // set by the record thread (renderer.cpp)
 
 namespace {
 
@@ -238,7 +249,7 @@ const bool g_main_pinner = [] {
   std::thread([] {
     const int n = int(sysconf(_SC_NPROCESSORS_CONF));
     if (n < 4) return;
-    int tid = 0, pinned = -1, nice_now = 0, background = -1;
+    int tid = 0, pinned = -1, nice_now = 0, background = -1, record_tid = 0, record_cores = 0;
     Roles roles{};
     uint32_t pass = 0;
     bool policy = false;
@@ -273,19 +284,30 @@ const bool g_main_pinner = [] {
         PlaceThreads(tid, n, want_roles);
         roles = want_roles;
       }
-      const int want = REXCVAR_GET(gtav_android_main_prime) ? 1 : 0;
+      const int record_want = std::clamp(REXCVAR_GET(gtav_android_record_cores), 0, 3);
+      if (const int rt = gtav_android_record_tid.load(std::memory_order_relaxed);
+          rt && (rt != record_tid || record_want != record_cores)) {
+        if (SetAffinity(rt, record_want == 1 || record_want == 3 ? n - 1 : n / 2, record_want == 0 ? n - 2 : n - 1)) {
+          REXLOG_INFO("[android] record thread {} on {}", rt,
+                      record_want == 0 ? "the middle cores" : record_want == 2 ? "the middle and prime cores" : "the prime core");
+          record_tid = rt, record_cores = record_want;
+        }
+      }
+      // 2: the middle cores (the record thread has the prime core, record_cores 3).
+      const int want = record_want == 3 ? 2 : REXCVAR_GET(gtav_android_main_prime) ? 1 : 0;
       // (Every pass while one is on: threads come and go, and new ones inherit their creator's
       // mask. One more pass after both went off puts the masks back.)
-      const bool exclusive = want && pinned == 1 && REXCVAR_GET(gtav_android_prime_exclusive);
+      const bool exclusive = want == 1 && pinned == 1 && REXCVAR_GET(gtav_android_prime_exclusive);
       const bool guest_big = REXCVAR_GET(gtav_android_guest_big);
       if (exclusive || guest_big || policy) ApplyThreadPolicy(tid, n, exclusive, guest_big);
       policy = exclusive || guest_big;
       if (want == pinned) continue;
-      if (!(want ? SetAffinity(tid, n - 1, n - 1) : SetAffinity(tid, 0, n - 1))) {
+      if (!(want == 1 ? SetAffinity(tid, n - 1, n - 1) : want == 2 ? SetAffinity(tid, n / 2, n - 2) : SetAffinity(tid, 0, n - 1))) {
         tid = 0;  // gone (or a new run of it): look it up again
         continue;
       }
-      if (pinned < 0) REXLOG_INFO("[android] main thread {} {}", tid, want ? "pinned to the prime core" : "unpinned");
+      REXLOG_INFO("[android] main thread {} {}", tid,
+                  want == 1 ? "pinned to the prime core" : want == 2 ? "on the middle cores" : "unpinned");
       pinned = want;
     }
   }).detach();

@@ -120,6 +120,9 @@ extern bool g_colorInputAttachments;
 // the renderer threads onto little cores, where recording a frame takes about 3x as long: keep
 // them on the cores of the top two clusters (the upper half of the CPU numbers), except the last
 // (prime) one, which the game's main thread gets (android_threads.cpp, --gtav_android_main_prime).
+#ifdef __ANDROID__
+extern std::atomic<int> gtav_android_record_tid;  // android_threads.cpp
+#endif
 static void PinToBigCores() {
   int n = int(sysconf(_SC_NPROCESSORS_CONF));
   if (n < 4) return;
@@ -1763,6 +1766,9 @@ class Renderer {
   void ThreadMain() {
     NameThread("gtav-record");
     PinToBigCores();
+#ifdef __ANDROID__
+    gtav_android_record_tid.store(gettid(), std::memory_order_relaxed);  // android_threads.cpp may move it
+#endif
     linux_threads::Note(linux_threads::kRender);
 #if defined(__APPLE__)
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);  // keep it on the performance cores

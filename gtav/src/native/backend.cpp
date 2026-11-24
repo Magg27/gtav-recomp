@@ -152,6 +152,9 @@ REXCVAR_DEFINE_DOUBLE(gtav_native_pipeline_wait_ms, GTAV_PIPELINE_WAIT_DEFAULT, 
 // Live experiments for the clear-sky slabs (settable while running through logs/menu_set).
 REXCVAR_DEFINE_BOOL(gtav_native_colorless, true, "GTAV",
                     "Depth-only draws keep the bound pass's colour attachments with writes off (fewer passes)");
+REXCVAR_DEFINE_BOOL(gtav_native_keep_targets, false, "GTAV",
+                    "Draws into some of the bound pass's attachments (fewer colour targets, or no depth) keep the "
+                    "pass and leave the others unwritten, instead of starting a pass with the smaller set (live)");
 REXCVAR_DEFINE_BOOL(gtav_native_depth_clamp, false, "GTAV", "Experiment: depth clamp instead of far/near clipping");
 REXCVAR_DEFINE_DOUBLE(gtav_native_depth_bias_scale, 1.0, "GTAV",
                       "Native renderer (diagnostic, live): multiplier on the constant part of the guest polygon "
@@ -1345,10 +1348,18 @@ class PipelineWarmer {
 };
 
 // Adds the scope's duration (ms) to `acc`: per-frame cost breakdown for the hitch log.
+// `scale` 0: not timed, no clock reads. The per-texture timers run 800-2,500 times a frame and pass
+// the record profile's sampled frames (every 8th, scale 8): their clock reads alone were 2.5% of
+// the record thread on the S23 FE.
 struct ScopedMs {
   double& acc;
-  std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-  ~ScopedMs() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
+  double scale = 1.0;
+  std::chrono::steady_clock::time_point t0 =
+      scale != 0.0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  ~ScopedMs() {
+    if (scale != 0.0)
+      acc += scale * std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  }
 };
 
 struct UploadAllocation {
@@ -2501,6 +2512,7 @@ struct Backend::Impl {
     labels.push_back(std::move(label));
   }
 
+  uint32_t kept_targets = 0;  // draws that kept the bound pass's larger target set (--gtav_native_keep_targets)
   void PassBegin(const char* why) {
     if (pass_stats) pass_reasons[why]++;
     if (seqdiag) seq_passes += fmt::format("  [pass: {}]\n", why);
@@ -3046,7 +3058,7 @@ struct Backend::Impl {
     if (t.texture && t.bytes > kSmallTexture &&
         frame - t.checked_frame < uint64_t(std::max(1, REXCVAR_GET(gtav_native_texture_recheck_frames))) &&
         !REXCVAR_GET(gtav_native_exact_cache)) {
-      ScopedMs st{tprof.sampled_ms};
+      ScopedMs st{tprof.sampled_ms, prof.on ? 8.0 : 0.0};
       tprof.sampled++;
       if (HashGuestTexture(words, true) == t.sampled_hash) {
         t.sample_frame = frame;
@@ -3062,7 +3074,7 @@ struct Backend::Impl {
     }
     uint64_t raw;
     {
-      ScopedMs ft{tprof.full_ms};
+      ScopedMs ft{tprof.full_ms, prof.on ? 8.0 : 0.0};
       tprof.full++;
       tprof.full_bytes += t.bytes;
       const PreHashItem* pre = nullptr;
@@ -3216,7 +3228,19 @@ struct Backend::Impl {
     if (pass_stats) {
       bool same_targets = bound_depth == depth;
       for (uint32_t i = 0; i < 4; i++) same_targets = same_targets && bound_color[i] == (i < count ? color[i] : nullptr);
-      if (bound_fb) PassBegin("target change");
+      if (bound_fb) {
+        // Which way the set changed: "subset" (the new set is the bound one minus some attachments,
+        // so the pass could have gone on), "superset", or "other".
+        uint32_t was = 0;
+        bool sub = !depth || bound_depth == depth, super = !bound_depth || bound_depth == depth;
+        for (uint32_t i = 0; i < 4; i++) {
+          RenderTarget* now = i < count ? color[i] : nullptr;
+          if (bound_color[i]) was++;
+          if (now != bound_color[i]) (now ? sub : super) = false, (bound_color[i] ? super : sub) = false;
+        }
+        PassBegin(fmt::format("target change {}c{} -> {}c{} ({})", was, bound_depth ? "+d" : "", count, depth ? "+d" : "",
+                              sub ? "subset" : super ? "superset" : "other").c_str());
+      }
       else PassBegin(fmt::format("{}{}", same_targets ? "RESTART after " : "new targets after ", pass_end).c_str());
     }
     for (uint32_t i = 0; i < count; i++) Transition(list, color[i]->texture.get(), RenderTextureLayout::COLOR_WRITE);
@@ -4844,6 +4868,26 @@ struct Backend::Impl {
 
     uint32_t diag = count ? DiagFor(d.vs_hash, d.ps_hash) : kDiagOff;
     if (diag == kDiagFlat || diag == kDiagFlatDepthAlways) ps = diag_flat_ps.get();
+    // --gtav_native_keep_targets: the same for draws into a subset of the bound attachments. GTA's
+    // G-buffer fill alternates between its four colour targets and the first one alone (colour mask
+    // 0 for the others), and its lighting between colour + depth and colour alone: 7-12 passes over
+    // the same five attachments, each a store and a load of all of them on a tile GPU. The guest's
+    // colour mask is already 0 for the attachments the draw does not have, and a draw without depth
+    // has its depth and stencil tests off. Decided here, after the draw's textures were looked up:
+    // sampling one of the attachments ends the pass (bound_fb is null then) and the draw gets its
+    // own set.
+    if (!colorless && count && bound_fb && REXCVAR_GET(gtav_native_keep_targets)) {
+      uint32_t bound_count = 0;
+      while (bound_count < 4 && bound_color[bound_count]) bound_count++;
+      bool subset = bound_count >= count && (depth ? depth == bound_depth : bound_depth != nullptr || bound_count > count);
+      for (uint32_t i = 0; subset && i < count; i++) subset = color[i] == bound_color[i];
+      if (subset && (bound_count > count || depth != bound_depth)) {
+        bind_color = bound_color;
+        bind_count = bound_count;
+        depth = bound_depth;
+        kept_targets++;
+      }
+    }
     uint64_t pkey = PipelineKey(d, decl.layout_hash, bind_color, bind_count, depth, r, topo.topology, spec, diag, colorless);
     RenderPipeline* pipeline =
         Pipeline(pkey, vs, ps, vl, bind_color, bind_count, depth, r, topo.topology, spec, d.primitive == 8, diag, colorless,
@@ -6865,6 +6909,8 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
       s.stat_compute_resolves = 0;
       if (s.stat_copy_resolves) REXLOG_INFO("[native]   resolves as image copies per frame: {:.1f}", s.stat_copy_resolves / n);
       s.stat_copy_resolves = 0;
+      if (s.kept_targets) REXLOG_INFO("[native]   draws that kept the bound pass's larger target set per frame: {:.1f}", s.kept_targets / n);
+      s.kept_targets = 0;
       {
         std::vector<std::pair<uint32_t, std::string>> v;
         for (auto& [k, c] : s.pass_reasons) v.emplace_back(c, k);
