@@ -109,7 +109,7 @@ it links statically, XenosRecomp, plume) is in gtav-recomp-src-<version>.tar.xz 
 release page.
 Bundled tools: clang and lld from LLVM 19.1.7 (official release build, Apache-2.0 with LLVM
 exception), DirectX Shader Compiler (NCSA), MoltenVK and the Vulkan loader (Apache-2.0), simde
-(MIT). tools/game_dll/libSystem.tbd is a list of five C library function names (this project) that
+(MIT). tools/game_dll/libSystem.tbd is a list of six C library function names (this project) that
 lets the bundled linker build gtav_game.dylib without Apple's SDK.
 Licenses for the bundled open-source components are in LICENSES/.
 Grand Theft Auto V is a trademark of Take-Two Interactive Software. This project is not affiliated

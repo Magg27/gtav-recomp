@@ -4,7 +4,7 @@
 # macOS) needs to build the player's gtav_game.dylib for it with the bundled clang + lld:
 #   OUT_DIR/GTAV.app             the shell (gtav, SDK runtime, MoltenVK, Info.plist)
 #   OUT_DIR/interface/           gtav_hooks.h, gtav_game.exports, gtav_game.undefs (names only)
-#   OUT_DIR/libSystem_ios.tbd    our list of five C library names (no Apple SDK needed to link)
+#   OUT_DIR/libSystem_ios.tbd    our list of six C library names (no Apple SDK needed to link)
 #   OUT_DIR/include/simde/       simde (MIT): SSE intrinsics on NEON for the generated code
 # The player's GTAV.ipa is signed by Sideloadly / AltStore with their own Apple ID.
 #   tools/ios/make_shell.sh OUT_DIR
