@@ -5066,7 +5066,7 @@ index db830e4..f053f2a 100644
    bool success = semaphore_->Release(release_count, &previous_count);
    if (out_previous_count) {
 diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
-index 77bce25..2669718 100644
+index 77bce25..9da5c3f 100644
 --- a/src/system/xthread.cpp
 +++ b/src/system/xthread.cpp
 @@ -37,6 +37,41 @@
@@ -5111,7 +5111,26 @@ index 77bce25..2669718 100644
  REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
                      "Ignores game-specified thread priorities");
  
-@@ -183,6 +218,18 @@ void XThread::set_name(const std::string_view name) {
+@@ -172,8 +207,18 @@ void XThread::set_last_error(uint32_t error_code) {
+   guest_object<X_KTHREAD>()->last_error = error_code;
+ }
+ 
++// A thread's name (thread_name_ here, name_ of the host thread) is a plain std::string with
++// three writers: the thread itself as it starts, its creator (the default name right after
++// Create), and any thread that changes its priority or affinity (RefreshHostName). Two of them
++// at once assigned the same string and freed its old buffer twice: an abort in
++// KeSetBasePriorityThread at boot on the S23 FE (11-23, the first run with the main thread on the
++// cores its new threads start on). One lock for all of them; names change a few hundred times
++// in a session.
++static std::mutex g_thread_name_mutex;
++
+ void XThread::set_name(const std::string_view name) {
+   std::lock_guard<std::mutex> lock(thread_lock_);
++  std::lock_guard<std::mutex> names(g_thread_name_mutex);
+   thread_name_ = fmt::format("{} ({:08X})", name, handle());
+ 
+   if (thread_) {
+@@ -183,6 +228,19 @@ void XThread::set_name(const std::string_view name) {
    }
  }
  
@@ -5121,6 +5140,7 @@ index 77bce25..2669718 100644
 +// apart. Refreshed when the game changes either.
 +static void RefreshHostName(rex::thread::Thread* host, const std::string& name, uint32_t handle,
 +                            uint8_t cpu, int32_t priority) {
++  std::lock_guard<std::mutex> names(g_thread_name_mutex);  // `name` is the XThread's thread_name_
 +  if (!host || name.rfind("XThread", 0) != 0) return;
 +  auto wanted = fmt::format("XThread{}p{:+03d}{:03X}", cpu % 10, std::clamp(priority, -99, 99),
 +                            handle & 0xFFF);
@@ -5130,15 +5150,20 @@ index 77bce25..2669718 100644
  static uint8_t next_cpu = 0;
  static uint8_t GetFakeCpuNumber(uint8_t proc_mask) {
    // NOTE: proc_mask is logical processors, not physical processors or cores.
-@@ -441,6 +488,7 @@ X_STATUS XThread::Create() {
+@@ -440,7 +498,11 @@ X_STATUS XThread::Create() {
+     rex::thread::set_current_thread_id(handle());
  
      // Set name immediately, if we have one.
-     thread_->set_name(thread_name_);
+-    thread_->set_name(thread_name_);
++    {
++      std::lock_guard<std::mutex> names(g_thread_name_mutex);
++      thread_->set_name(thread_name_);
++    }
 +    RefreshHostName(thread_.get(), thread_name_, handle(), active_cpu(), priority_);
  
      PROFILE_THREAD_ENTER(thread_name_.c_str());
      PROFILE_THREAD_CREATED();
-@@ -470,7 +518,9 @@ X_STATUS XThread::Create() {
+@@ -470,7 +532,9 @@ X_STATUS XThread::Create() {
      set_name(fmt::format("XThread{:04X}", thread_->system_id()));
    }
  
@@ -5149,7 +5174,7 @@ index 77bce25..2669718 100644
      thread_->set_priority(creation_params_.creation_flags & 0x20 ? 1 : 0);
    }
  
-@@ -637,6 +687,7 @@ void XThread::Execute() {
+@@ -637,6 +701,7 @@ void XThread::Execute() {
      ctx->r10.u64 = args[7];
  
    ctx->fpscr.InitHost();
@@ -5157,7 +5182,7 @@ index 77bce25..2669718 100644
  
    // Convert this host thread to a fiber so SwitchTo works bidirectionally.
    // Required on Windows before any CreateFiber; provides the fallback handle
-@@ -856,6 +907,7 @@ void XThread::SetPriority(int32_t increment) {
+@@ -856,6 +921,7 @@ void XThread::SetPriority(int32_t increment) {
    if (!REXCVAR_GET(ignore_thread_priorities)) {
      thread_->set_priority(target_priority);
    }
@@ -5165,7 +5190,7 @@ index 77bce25..2669718 100644
  }
  
  void XThread::SetAffinity(uint32_t affinity) {
-@@ -901,6 +953,7 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
+@@ -901,6 +967,7 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
    } else {
      REXSYS_WARN("Too few processor cores - scheduling will be wonky");
    }
@@ -5173,7 +5198,7 @@ index 77bce25..2669718 100644
  }
  
  bool XThread::GetTLSValue(uint32_t slot, uint32_t* value_out) {
-@@ -1025,8 +1078,33 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
+@@ -1025,8 +1092,33 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
      }
    } else {
      if (timeout_ms == 0) {

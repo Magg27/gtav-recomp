@@ -18,6 +18,10 @@ std::unique_ptr<rex::input::InputDriver> CreateDriver();
 // Whether the overlay is shown (cvar gtav_touch_controls, hidden while a real pad is connected).
 bool Visible();
 
+// The lower edge, in pixels of a screen h high, of the overlay's Menu button (it stays on screen
+// while the settings menu is open); 0 while the overlay is hidden.
+float MenuButtonBottom(float h);
+
 // Draws the controls into the overlay (swap chain size w x h pixels).
 void Draw(ImDrawList* list, float w, float h);
 

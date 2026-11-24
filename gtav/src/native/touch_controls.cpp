@@ -35,6 +35,11 @@ REXCVAR_DEFINE_BOOL(gtav_touch_controls, false, "GTAV", "Show the on-screen game
 #if defined(__APPLE__) && TARGET_OS_IPHONE
 #define GTAV_TOUCH_SCALE_DEFAULT 1.3
 #define GTAV_TOUCH_INSET_DEFAULT 0.16
+#elif defined(__ANDROID__)
+// The same physical size on a 6.4-inch phone as 1.3 on the 5.4-inch iPhone (settings menu:
+// "Touch button size").
+#define GTAV_TOUCH_SCALE_DEFAULT 1.1
+#define GTAV_TOUCH_INSET_DEFAULT 0.0
 #else
 #define GTAV_TOUCH_SCALE_DEFAULT 1.0
 #define GTAV_TOUCH_INSET_DEFAULT 0.0
@@ -77,9 +82,9 @@ const Control kControls[] = {
     {"v", kButton, X_INPUT_GAMEPAD_DPAD_DOWN, false, 0.36f, 0.32f, 0.05f},
     {"<", kButton, X_INPUT_GAMEPAD_DPAD_LEFT, false, 0.26f, 0.22f, 0.05f},
     {">", kButton, X_INPUT_GAMEPAD_DPAD_RIGHT, false, 0.46f, 0.22f, 0.05f},
-    {"Back", kButton, X_INPUT_GAMEPAD_BACK, false, 0.0f, 0.06f, 0.05f},   // x set at runtime (centre)
-    {"Start", kButton, X_INPUT_GAMEPAD_START, false, 0.0f, 0.06f, 0.05f},
-    {"Menu", kMenu, 0, false, 0.0f, 0.06f, 0.05f},  // the settings menu (centre top)
+    {"Back", kButton, X_INPUT_GAMEPAD_BACK, false, 0.0f, 0.06f, 0.06f},   // x set at runtime (centre)
+    {"Start", kButton, X_INPUT_GAMEPAD_START, false, 0.0f, 0.06f, 0.06f},
+    {"Menu", kMenu, 0, false, 0.0f, 0.06f, 0.06f},  // the settings menu (centre top)
 };
 constexpr int kControlCount = int(sizeof(kControls) / sizeof(kControls[0]));
 constexpr float kStickRadius = 0.14f;  // full deflection, units of h
@@ -104,8 +109,9 @@ float CenterX(int i, float w, float h) {
   const Control& c = kControls[i];
   const float s = Scale();
   if (c.kind == kMenu) return w * 0.5f;
-  if (c.button == X_INPUT_GAMEPAD_BACK) return w * 0.5f - 0.13f * s * h;
-  if (c.button == X_INPUT_GAMEPAD_START) return w * 0.5f + 0.13f * s * h;
+  // 0.15: the three top buttons' hit circles (radius x 1.25) touch but do not overlap.
+  if (c.button == X_INPUT_GAMEPAD_BACK) return w * 0.5f - 0.15f * s * h;
+  if (c.button == X_INPUT_GAMEPAD_START) return w * 0.5f + 0.15f * s * h;
   const float from_edge = (std::fabs(c.x) * s + Inset()) * h;
   return c.x < 0 ? w - from_edge : from_edge;
 }
@@ -271,6 +277,13 @@ bool Visible() {
     pad = RealPadConnected();
   }
   return !pad.load();
+}
+
+float MenuButtonBottom(float h) {
+  if (!Visible()) return 0.0f;
+  for (int i = 0; i < kControlCount; i++)
+    if (kControls[i].kind == kMenu) return CenterY(i, h) + Radius(i, h);
+  return 0.0f;
 }
 
 void Draw(ImDrawList* list, float w, float h) {

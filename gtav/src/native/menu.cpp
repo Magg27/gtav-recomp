@@ -69,6 +69,10 @@ constexpr const char* kSettings[] = {
     "gtav_native_texture_recheck_frames",
     "gtav_native_record_workers",
     "gtav_touch_controls",
+    "gtav_touch_scale",
+#if GTAV_MENU_PHONE
+    "gtav_native_cube_every",
+#endif
 #if !GTAV_MENU_PHONE
     "gtav_fullscreen",
     "gtav_native_render_scale",
@@ -136,8 +140,8 @@ void EnsureContext(uint32_t h) {
   io.LogFilename = nullptr;
   io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
   g_scale = std::max(1.0f, float(h) / 720.0f);
-#if defined(__APPLE__) && TARGET_OS_IPHONE
-  g_scale *= 1.6f;  // a 5.4-inch screen driven by fingers: larger text and controls
+#if GTAV_MENU_PHONE
+  g_scale *= 1.6f;  // a 5.4 to 6.7-inch screen driven by fingers: larger text and controls
 #endif
   ImFontConfig font;
   font.SizePixels = 15.0f * g_scale;
@@ -146,6 +150,17 @@ void EnsureContext(uint32_t h) {
   ImGuiStyle& style = ImGui::GetStyle();
   style.WindowRounding = 6.0f;
   style.FrameRounding = 4.0f;
+#if GTAV_MENU_PHONE
+  // Rows a finger can hit: taller controls with space between them, a slider grab and a scroll
+  // bar wide enough to drag, and a margin around every control that still counts as a hit.
+  style.FramePadding = ImVec2(8.0f, 10.0f);
+  style.ItemSpacing = ImVec2(10.0f, 8.0f);
+  style.ItemInnerSpacing = ImVec2(8.0f, 6.0f);
+  style.WindowPadding = ImVec2(12.0f, 10.0f);
+  style.GrabMinSize = 26.0f;
+  style.ScrollbarSize = 26.0f;
+  style.TouchExtraPadding = ImVec2(3.0f, 3.0f);
+#endif
   style.ScaleAllSizes(g_scale);
   if (previous) ImGui::SetCurrentContext(previous);
 }
@@ -170,39 +185,42 @@ ImGuiKey ToImGui(Key key) {
 }
 
 void Build(uint32_t fps, double frame_ms) {
-#if defined(__APPLE__) && TARGET_OS_IPHONE
-  // Centred: the screen's sides are under the rounded corners and the notch.
+  bool open = true;
+#if GTAV_MENU_PHONE
+  // Phones: one sheet under the overlay's Menu button, as wide as the screen allows, two columns
+  // of finger-sized rows with the rarely used groups folded away, and a Close button instead of
+  // the title bar's 3 mm box. (At the desktop layout a checkbox was 2 mm across on a 6.4-inch
+  // screen.) It does not move: a finger on its background is not a drag.
   const ImVec2 display = ImGui::GetIO().DisplaySize;
-  ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+  const float top = touch::MenuButtonBottom(display.y) + display.y * 0.015f;
+  ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, top), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+  ImGui::SetNextWindowSizeConstraints(ImVec2(0.0f, 0.0f), ImVec2(display.x, display.y - top - 4.0f * g_scale));
+  ImGui::SetNextWindowSize(ImVec2(std::min(display.x * 0.94f, 800.0f * g_scale), 0.0f), ImGuiCond_Always);
+  const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
+  if (!ImGui::Begin("Settings", &open, flags)) {
+    ImGui::End();
+    return;
+  }
+  {
+    const float close_w = 110.0f * g_scale;
+    ImGui::AlignTextToFramePadding();
+    ImGui::Text("Settings      %u fps  (%.1f ms per frame)", fps, frame_ms);
+    ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - close_w);  // left of the scroll bar, if any
+    if (ImGui::Button("Close", ImVec2(close_w, 0.0f))) open = false;
+  }
 #else
   ImGui::SetNextWindowPos(ImVec2(40.0f * g_scale, 40.0f * g_scale), ImGuiCond_FirstUseEver);
-#endif
   ImGui::SetNextWindowSize(ImVec2(520.0f * g_scale, 0.0f), ImGuiCond_FirstUseEver);
-  bool open = true;
   if (!ImGui::Begin("Settings (F1 / Esc / B to close)", &open, ImGuiWindowFlags_NoCollapse)) {
     ImGui::End();
     return;
   }
   ImGui::Text("%u fps  (%.1f ms per frame)", fps, frame_ms);
-  ImGui::Separator();
-
-  ImGui::TextUnformatted("Preset");
-  if (ImGui::Button("Best image")) ApplyPreset(true);
-  ImGui::SameLine();
-  if (ImGui::Button("Max performance")) ApplyPreset(false);
-  ImGui::TextDisabled("Compare the fps above after switching.");
+#endif
   ImGui::Separator();
 
   bool changed = false;
-  int limit = std::atoi(rex::cvar::GetFlagByName("gtav_fps_limit").c_str());
-  int choice = limit == 30 ? 0 : limit == 60 ? 1 : limit <= 0 ? 2 : 3;
-  const char* limits[] = {"30 (the game's own limiter)", "60", "Uncapped", "Custom (command line)"};
-  ImGui::SetNextItemWidth(260.0f * g_scale);
-  if (ImGui::Combo("Frame rate limit", &choice, limits, choice == 3 ? 4 : 3) && choice < 3) {
-    rex::cvar::SetFlagByName("gtav_fps_limit", choice == 0 ? "30" : choice == 1 ? "60" : "0");
-    changed = true;
-  }
-
   auto check = [&](const char* label, const char* name, const char* help) {
     bool v = GetBool(name);
     if (ImGui::Checkbox(label, &v)) {
@@ -211,9 +229,49 @@ void Build(uint32_t fps, double frame_ms) {
     }
     if (help && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", help);
   };
+  // Combos and sliders. Desktop: the label to the right of a control `width` wide. Phones: the
+  // label on its own line and the control as wide as its column, so the whole row is the target.
+  std::string wide_id;
+  auto wide = [&](const char* label, float width) {
+#if GTAV_MENU_PHONE
+    (void)width;
+    ImGui::TextUnformatted(label);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    wide_id = std::string("##") + label;
+#else
+    ImGui::SetNextItemWidth(width * g_scale);
+    wide_id = label;
+#endif
+    return wide_id.c_str();
+  };
+
+  auto presets = [&] {
+#if GTAV_MENU_PHONE
+    // Two buttons as wide as the column: the presets are what a phone player changes most.
+    const float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+    if (ImGui::Button("Best image", ImVec2(half, 0.0f))) ApplyPreset(true);
+    ImGui::SameLine();
+    if (ImGui::Button("Max performance", ImVec2(half, 0.0f))) ApplyPreset(false);
+#else
+    ImGui::TextUnformatted("Preset");
+    if (ImGui::Button("Best image")) ApplyPreset(true);
+    ImGui::SameLine();
+    if (ImGui::Button("Max performance")) ApplyPreset(false);
+    ImGui::TextDisabled("Compare the fps above after switching.");
+#endif
+  };
+  auto frame_rate = [&] {
+    int limit = std::atoi(rex::cvar::GetFlagByName("gtav_fps_limit").c_str());
+    int choice = limit == 30 ? 0 : limit == 60 ? 1 : limit <= 0 ? 2 : 3;
+    const char* limits[] = {"30 (the game's own limiter)", "60", "Uncapped", "Custom (command line)"};
+    if (ImGui::Combo(wide("Frame rate limit", 260.0f), &choice, limits, choice == 3 ? 4 : 3) && choice < 3) {
+      rex::cvar::SetFlagByName("gtav_fps_limit", choice == 0 ? "30" : choice == 1 ? "60" : "0");
+      changed = true;
+    }
+  };
 #if !GTAV_MENU_PHONE
-  check("Fullscreen", "gtav_fullscreen", "Borderless fullscreen at the desktop resolution. F11 or Alt+Enter also toggle it.");
-  {
+  auto display_settings = [&] {
+    check("Fullscreen", "gtav_fullscreen", "Borderless fullscreen at the desktop resolution. F11 or Alt+Enter also toggle it.");
     // The game renders at 1280x720 on the Xbox; the native renderer can draw its 3D passes at a
     // multiple of that. Read once at start (render targets are made at that size).
     static const double kScales[] = {0.75, 1.0, 1.5, 2.0};
@@ -223,8 +281,7 @@ void Build(uint32_t fps, double frame_ms) {
     int choice = 1;
     for (int i = 0; i < 4; i++)
       if (std::abs(now - kScales[i]) < 0.01) choice = i;
-    ImGui::SetNextItemWidth(260.0f * g_scale);
-    if (ImGui::Combo("Resolution", &choice, kNames, 4)) {
+    if (ImGui::Combo(wide("Resolution", 260.0f), &choice, kNames, 4)) {
       rex::cvar::SetFlagByName("gtav_native_render_scale", std::to_string(kScales[choice]));
       changed = true;
     }
@@ -232,88 +289,73 @@ void Build(uint32_t fps, double frame_ms) {
       ImGui::SetTooltip("3D rendering resolution (the HUD and menus stay at the game's own size).\n"
                         "Takes effect the next time the game starts.");
     if (std::abs(now - started) > 0.01) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "Restart the game to apply the new resolution.");
-  }
+  };
 #endif
-  check("30 fps in vehicles (Xbox handling)", "gtav_vehicle_30fps",
-        "Driving and flying are tuned for the Xbox's 30 fps: above it steering and handling get too fast.\n"
-        "On: vehicles run at 30 fps, on foot the limit above applies.");
-  check("VSync", "gtav_native_vsync", "Wait for the display refresh: no tearing, fps capped at the refresh rate.");
-  check("FPS counter", "gtav_native_fps", "Frames per second in the top-left corner.");
-  ImGui::Separator();
-  ImGui::TextUnformatted("Accuracy");
-  check("Per-pixel sun shadows", "gtav_native_tile_penumbra_all",
-        "On: every screen tile computes sun shadows per pixel (no blocky shadows or car reflections).\n"
-        "Off: the game's own per-tile shortcut, which goes blocky on this renderer (gray 16x16 blocks).");
-  check("Compile new effects in the background", "gtav_native_async_pipelines",
-        "On: no hitch when a new effect first appears; it is skipped for a frame or two instead.\n"
-        "Off: it is drawn from its first frame, with a short hitch while it is built.");
-  {
-    bool fast = std::atoi(rex::cvar::GetFlagByName("gpu_skip_rendering_lag_ms").c_str()) < std::atoi(kSafeGpuLag);
-    if (ImGui::Checkbox("Low GPU latency", &fast)) {
-      rex::cvar::SetFlagByName("gpu_skip_rendering_lag_ms", fast ? kFastGpuLag : kSafeGpuLag);
-      changed = true;
+  auto pacing = [&] {
+    check(GTAV_MENU_PHONE ? "30 fps in vehicles" : "30 fps in vehicles (Xbox handling)", "gtav_vehicle_30fps",
+          "Driving and flying are tuned for the Xbox's 30 fps: above it steering and handling get too fast.\n"
+          "On: vehicles run at 30 fps, on foot the limit above applies.");
+    check("VSync", "gtav_native_vsync", "Wait for the display refresh: no tearing, fps capped at the refresh rate.");
+    check("FPS counter", "gtav_native_fps", "Frames per second in the top-left corner.");
+  };
+  auto accuracy = [&] {
+    check("Per-pixel sun shadows", "gtav_native_tile_penumbra_all",
+          "On: every screen tile computes sun shadows per pixel (no blocky shadows or car reflections).\n"
+          "Off: the game's own per-tile shortcut, which goes blocky on this renderer (gray 16x16 blocks).");
+    check("Compile new effects in the background", "gtav_native_async_pipelines",
+          "On: no hitch when a new effect first appears; it is skipped for a frame or two instead.\n"
+          "Off: it is drawn from its first frame, with a short hitch while it is built.");
+    {
+      bool fast = std::atoi(rex::cvar::GetFlagByName("gpu_skip_rendering_lag_ms").c_str()) < std::atoi(kSafeGpuLag);
+      if (ImGui::Checkbox("Low GPU latency", &fast)) {
+        rex::cvar::SetFlagByName("gpu_skip_rendering_lag_ms", fast ? kFastGpuLag : kSafeGpuLag);
+        changed = true;
+      }
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("On: the emulated GPU trails the game by 2 ms instead of 6 (about 20%% more fps).\n"
+                          "Off: the tested setting; with On, watch foliage and distant meshes while driving.");
     }
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("On: the emulated GPU trails the game by 2 ms instead of 6 (about 20%% more fps).\n"
-                        "Off: the tested setting; with On, watch foliage and distant meshes while driving.");
-  }
-  {
-    // --gtav_native_record_workers (docs/HANDOFF_MT_RENDERER_2026-11-22.md). Live.
-    int workers = std::atoi(rex::cvar::GetFlagByName("gtav_native_record_workers").c_str());
-    workers = workers < 0 ? 0 : workers > 3 ? 3 : workers;
-    const char* names[] = {"Off", "1", "2", "3"};
-    ImGui::SetNextItemWidth(120.0f * g_scale);
-    if (ImGui::Combo("Record threads (experimental)", &workers, names, 4)) {
-      rex::cvar::SetFlagByName("gtav_native_record_workers", std::to_string(workers));
-      changed = true;
+#if GTAV_MENU_PHONE
+    {
+      // --gtav_native_cube_every: the reflection cube (6 faces, ~345 draws a frame) redrawn every
+      // second frame. S23 FE, heat-capped, same-run A/B: +2-5% fps, GPU -1.0 to -1.7 ms a frame.
+      bool half = std::atoi(rex::cvar::GetFlagByName("gtav_native_cube_every").c_str()) >= 2;
+      if (ImGui::Checkbox("Reflections every other frame", &half)) {
+        rex::cvar::SetFlagByName("gtav_native_cube_every", half ? "2" : "1");
+        changed = true;
+      }
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("On: reflections on cars and wet roads update at half the frame rate (2-5%% more fps).");
     }
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("Extra threads that turn each frame into GPU commands next to the renderer's own.\n"
-                        "More fps where the renderer limits the frame rate (many draws, fast CPU);\n"
-                        "none, or slightly less, where the game itself is the limit (phones).");
-  }
-  ImGui::Separator();
-  ImGui::TextUnformatted("Textures");
-  check("Exact texture checks", "gtav_native_exact_cache",
-        "On: every texture is fully re-checked each frame: no stale gray blocks, but more CPU time.\n"
-        "Off: large textures are spot-checked between full checks (faster).");
-  {
+#endif
+    {
+      // --gtav_native_record_workers (docs/HANDOFF_MT_RENDERER_2026-11-22.md). Live.
+      int workers = std::atoi(rex::cvar::GetFlagByName("gtav_native_record_workers").c_str());
+      workers = workers < 0 ? 0 : workers > 3 ? 3 : workers;
+      const char* names[] = {"Off", "1", "2", "3"};
+      if (ImGui::Combo(wide("Record threads (experimental)", 120.0f), &workers, names, 4)) {
+        rex::cvar::SetFlagByName("gtav_native_record_workers", std::to_string(workers));
+        changed = true;
+      }
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Extra threads that turn each frame into GPU commands next to the renderer's own.\n"
+                          "More fps where the renderer limits the frame rate (many draws, fast CPU);\n"
+                          "none, or slightly less, where the game itself is the limit (phones).");
+    }
+  };
+  auto textures = [&] {
+    check("Exact texture checks", "gtav_native_exact_cache",
+          "On: every texture is fully re-checked each frame: no stale gray blocks, but more CPU time.\n"
+          "Off: large textures are spot-checked between full checks (faster).");
     int frames = std::atoi(rex::cvar::GetFlagByName("gtav_native_texture_recheck_frames").c_str());
-    ImGui::SetNextItemWidth(200.0f * g_scale);
-    if (ImGui::SliderInt("Full re-check every N frames", &frames, 1, 30)) {
+    if (ImGui::SliderInt(wide("Full re-check every N frames", 200.0f), &frames, 1, 30)) {
       rex::cvar::SetFlagByName("gtav_native_texture_recheck_frames", std::to_string(frames));
       changed = true;
     }
     if (ImGui::IsItemHovered())
       ImGui::SetTooltip("Lower: textures the game streams in show up sooner (fewer gray blocks), more CPU.");
-  }
-#if !GTAV_MENU_PHONE
-  ImGui::Separator();
-  ImGui::TextUnformatted("Keyboard and mouse");
-  if (ImGui::Button("Controls (keys, mouse, controller)...")) g_controls_open = true;
-  check("Mouse look", "mnk_mouse",
-        "The mouse turns the camera (right stick); the pointer is locked to the game window.\n"
-        "F1 (this menu) releases it.");
-  {
-    float sens = float(std::atof(rex::cvar::GetFlagByName("mnk_sensitivity").c_str()));
-    ImGui::SetNextItemWidth(200.0f * g_scale);
-    if (ImGui::SliderFloat("Mouse sensitivity", &sens, 0.1f, 5.0f, "%.2f")) {
-      rex::cvar::SetFlagByName("mnk_sensitivity", std::to_string(sens));
-      changed = true;
-    }
-  }
-  ImGui::TextDisabled("GTA V PC default keys: they switch with what you do (on foot, driving,\n"
-                      "flying, parachute, pause menu). Mouse wheel / 1-9: weapons, F5-F7: characters.\n"
-                      "F1 opens this menu, Esc is the game's pause.");
-  ImGui::Separator();
-  ImGui::TextUnformatted("Sound");
-  check("Stereo mix", "audio_force_stereo",
-        "On: the game's 5.1 mix is folded to stereo here (dialogue from the centre channel kept).\n"
-        "Off: 5.1 goes to the device when it reports more than 2 channels (real surround systems).\n"
-        "Takes effect the next time the game starts.");
-#endif
-  ImGui::Separator();
-  {
+  };
+  auto language = [&] {
     // The console language (XGetLanguage): the game's text and menus. Read when the game starts.
     static const char* kLanguages[] = {"English", "Japanese", "German", "French", "Spanish", "Italian", "Korean",
                                        "Chinese (Traditional)", "Portuguese", "Chinese (Simplified)", "Polish",
@@ -321,16 +363,14 @@ void Build(uint32_t fps, double frame_ms) {
     static const int started = std::atoi(rex::cvar::GetFlagByName("user_language").c_str());
     const int now = std::atoi(rex::cvar::GetFlagByName("user_language").c_str());
     int choice = now >= 1 && now <= 12 ? now - 1 : 0;
-    ImGui::SetNextItemWidth(260.0f * g_scale);
-    if (ImGui::Combo("Language", &choice, kLanguages, 12)) {
+    if (ImGui::Combo(wide("Language", 260.0f), &choice, kLanguages, 12)) {
       rex::cvar::SetFlagByName("user_language", std::to_string(choice + 1));
       changed = true;
     }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Text and menus (speech stays English). Applied at the next start.");
     if (now != started) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "Restart the game to apply the new language.");
-  }
-  ImGui::Separator();
-  {
+  };
+  auto shaders = [&] {
     // What the renderer has: shaders the game made, which have SPIR-V, which failed or are missing.
     static ShaderStats stats;
     static int refresh = 0;
@@ -356,20 +396,90 @@ void Build(uint32_t fps, double frame_ms) {
            "The game drew with these before they were ready (or they failed): objects can be missing.");
       if (!bad) ImGui::TextDisabled("Nothing missing.");
     }
+  };
+  auto bug_report = [&] {
+    // Phones: as wide as its column.
+    if (ImGui::Button("Create bug report", ImVec2(GTAV_MENU_PHONE ? -FLT_MIN : 0.0f, 0.0f))) {
+      g_last_report = gtav::bug_report::Create("settings menu");
+      if (!g_last_report.empty()) gtav::bug_report::ShowInFolder(g_last_report);
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Zips the game log, crash info, your settings and system info into one file.\n"
+                        "Attach it to an issue on github.com/andrewnakas/gtav-recomp/issues.");
+    if (!g_last_report.empty()) ImGui::TextWrapped("Saved: %s", g_last_report.c_str());
+  };
+
+#if GTAV_MENU_PHONE
+  ImGui::Columns(2, "phone", false);
+  presets();
+  frame_rate();
+  pacing();
+  ImGui::NextColumn();
+  check("Touch controls", "gtav_touch_controls", "The on-screen gamepad (hidden while a controller is connected).");
+  {
+    // --gtav_touch_scale: the on-screen gamepad's buttons and sticks. Live.
+    float size = float(std::atof(rex::cvar::GetFlagByName("gtav_touch_scale").c_str()));
+    if (ImGui::SliderFloat(wide("Touch button size", 200.0f), &size, 0.7f, 1.4f, "%.2f")) {
+      rex::cvar::SetFlagByName("gtav_touch_scale", std::to_string(size));
+      changed = true;
+    }
   }
+  language();
+  bug_report();
+  ImGui::Columns(1);
+  ImGui::Separator();
+  if (ImGui::CollapsingHeader("Advanced")) {
+    accuracy();
+    textures();
+    shaders();
+    ImGui::TextDisabled("Controller: RB + Back opens and closes this menu; D-pad + A to change, B to close.");
+  }
+#else
+  presets();
+  ImGui::Separator();
+  frame_rate();
+  display_settings();
+  pacing();
+  ImGui::Separator();
+  ImGui::TextUnformatted("Accuracy");
+  accuracy();
+  ImGui::Separator();
+  ImGui::TextUnformatted("Textures");
+  textures();
+  ImGui::Separator();
+  ImGui::TextUnformatted("Keyboard and mouse");
+  if (ImGui::Button("Controls (keys, mouse, controller)...")) g_controls_open = true;
+  check("Mouse look", "mnk_mouse",
+        "The mouse turns the camera (right stick); the pointer is locked to the game window.\n"
+        "F1 (this menu) releases it.");
+  {
+    float sens = float(std::atof(rex::cvar::GetFlagByName("mnk_sensitivity").c_str()));
+    ImGui::SetNextItemWidth(200.0f * g_scale);
+    if (ImGui::SliderFloat("Mouse sensitivity", &sens, 0.1f, 5.0f, "%.2f")) {
+      rex::cvar::SetFlagByName("mnk_sensitivity", std::to_string(sens));
+      changed = true;
+    }
+  }
+  ImGui::TextDisabled("GTA V PC default keys: they switch with what you do (on foot, driving,\n"
+                      "flying, parachute, pause menu). Mouse wheel / 1-9: weapons, F5-F7: characters.\n"
+                      "F1 opens this menu, Esc is the game's pause.");
+  ImGui::Separator();
+  ImGui::TextUnformatted("Sound");
+  check("Stereo mix", "audio_force_stereo",
+        "On: the game's 5.1 mix is folded to stereo here (dialogue from the centre channel kept).\n"
+        "Off: 5.1 goes to the device when it reports more than 2 channels (real surround systems).\n"
+        "Takes effect the next time the game starts.");
+  ImGui::Separator();
+  language();
+  ImGui::Separator();
+  shaders();
   ImGui::Separator();
   ImGui::TextUnformatted("Problems?");
-  if (ImGui::Button("Create bug report")) {
-    g_last_report = gtav::bug_report::Create("settings menu");
-    if (!g_last_report.empty()) gtav::bug_report::ShowInFolder(g_last_report);
-  }
-  if (ImGui::IsItemHovered())
-    ImGui::SetTooltip("Zips the game log, crash info, your settings and system info into one file.\n"
-                      "Attach it to an issue on github.com/andrewnakas/gtav-recomp/issues.");
-  if (!g_last_report.empty()) ImGui::TextWrapped("Saved: %s", g_last_report.c_str());
+  bug_report();
   ImGui::Separator();
   check("Touch controls", "gtav_touch_controls", "The on-screen gamepad (hidden while a controller is connected).");
   ImGui::TextDisabled("Controller: RB + Back opens/closes this menu; D-pad + A to change, B to close.");
+#endif
   if (changed) SaveSettings();
   ImGui::End();
 #if !GTAV_MENU_PHONE

@@ -330,11 +330,16 @@ Fifth batch, same day (where the GPU's time goes, thread placement, fewer render
   attachments it does not use is already 0, a draw without depth has its depth and stencil tests
   off). Linux (NVIDIA), same-run A/B `mp_kt_ab`: 153 -> 144.5 passes a frame, same picture
   (`ab_shots_diff.py`, 0 of 425 pairs out of range; in-world neighbours differ only where
-  something is animated), fps and recording time inside the noise there. **Not measured on the
-  phone yet** (it was not connected): `logs/phone_c3.sh` installs the build and runs the A/B, a
-  screenshot comparison, the GPU time by pass kind and the placement A/B again with the merge on
-  (`bash logs/phone_c3.sh > logs/android/mpc3_phone.out 2>&1`, about 25 minutes; `logs/` is not
-  in the repository, the script is a dozen lines around `tools/android/ab.sh`).
+  something is animated), fps and recording time inside the noise there. **Phone, same-run A/B
+  off | on** (`mpc3_kt`, phone cool, GPU at 545-734 MHz): 107-114 -> 99-102 passes a frame, GPU
+  14.3 | 15.0 (different draw counts), 15.7 | 15.2, 15.2 | 15.0, 14.8 | 14.8, 16.7 | 16.5,
+  18.8 | 18.5, 18.9 | 18.4, 16.5 | 16.0 ms, fps 53.2 | 52.3, 49.3 | 49.5, 50.3 | 50.6, 51.5 | 51.3,
+  46.4 | 45.9, 42.6 | 43.1, 44.6 | 44.6, 46.6 | 47.2; same picture (`mpc3_ktshot`, 0 of 39
+  cross-side screenshot pairs outside the same-side range). By pass kind with the merge on
+  (`mpc3_pass`, GPU capped at 285 MHz, 35.0 ms): the G-buffer fill 12.0 ms in 3.3 passes, which
+  is what 8.2 ms at 421 MHz comes to at 285 MHz, so the four extra stores and loads were not what
+  the G-buffer costs (it is the fill itself); lit scene 4.5 in 8.7 passes, shadow map 4.1,
+  reflection cube 2.2, resolve copies 1.1. 0.2-0.5 ms of GPU time and no fps: **left off**.
 - **The reflection cube can be redrawn every Nth frame** (`gtav_native_cube_every`, live, 1 by
   default: every frame). The game draws its 128x128 reflection cube map anew every frame: six
   times "clear, 20-90 draws into a multisampled target, resolve into a cube face", ~345 draws and
@@ -345,7 +350,16 @@ Fifth batch, same day (where the GPU's time goes, thread placement, fewer render
   windows move at 1/N of the frame rate; standing still the picture is the same. Linux, same-run
   A/B every frame | every other frame (`mp_cube_ab`): 1,600-1,650 -> 1,430-1,490 draws a frame,
   175 -> 169 passes, recording 8.6 | 8.4, 8.5 | 8.0, 6.2 | 5.8, 8.4 | 7.4, 7.6 | 6.7 ms, same
-  picture in the screenshots. **Not measured on the phone yet** (step 5 of `logs/phone_c3.sh`).
+  picture in the screenshots. **Phone, same-run A/B every frame | every other frame** (`mpc3_cube`,
+  GPU heat-capped at 220-545 MHz): fps 36.4 | 37.1, 37.2 | 39.1, 27.8 | 28.5, 27.8 | 29.0,
+  28.9 | 30.3; GPU 24.2 | 23.7, 25.6 | 23.9, 34.3 | 33.3, 34.5 | 33.1, 33.2 | 31.8 ms; recording
+  20.3 | 19.6, 19.0 | 17.7, 22.6 | 21.8, 23.1 | 21.8, 21.2 | 20.3 ms. +2-5% fps for reflections at
+  half rate: an option in the phone's settings menu (Advanced > "Reflections every other frame",
+  saved), off by default.
+- The placement A/B again with the pass merge on (`mpc3_rc`, record thread on the middle cores |
+  on the prime core, GPU capped at 285-545 MHz): recording 28.8 | 21.8, 27.6 | 20.3, 24.8 | 18.0,
+  26.6 | 19.7, 29.5 | 22.0, 30.3 | 22.5 ms, fps 32.8 | 36.1, 33.5 | 35.8, 34.1 | 34.7, 32.2 | 32.6,
+  29.2 | 29.2, 28.9 | 29.6. The default (3) stays.
 - The per-texture hash timers read the clock on the record profile's sampled frames only (every
   8th): 800-2,500 pairs of clock reads a frame were 2.5% of the record thread in `mpb9_prof`.
 - Measured on Linux and removed: the count of recorded draws that the GPU fences wait on moved
@@ -354,6 +368,36 @@ Fifth batch, same day (where the GPU's time goes, thread placement, fewer render
   per draw 4.92 | 4.98 us over ten same-run windows (`mp_ps_ab`), and that run copied far more
   draw data at fences (up to 37,900 draws, 1 GB, per 300 frames against 0-5,000 in the run
   before it): a count that is behind makes fences wait or copy.
+
+Sixth batch, same evening (a boot crash, the phone's settings menu, sound):
+- **Boot crash fixed (SDK).** The first phone run of the fifth batch's build aborted 15 s after
+  the start: Scudo "invalid chunk state when deallocating" under `PosixThread::set_name` <-
+  `RefreshHostName` (`xthread.cpp`) <- `KeSetBasePriorityThread` on the game's main thread. A
+  thread's name (`XThread::thread_name_` and the host thread's `name_`) is a plain `std::string`
+  with three writers: the thread itself as it starts, its creator (the default name right after
+  Create), and any thread that changes its priority or affinity. Two of them at once move-assigned
+  the same string. It needed the new placement to show (the main thread now runs on the cores its
+  new threads start on); the 30-odd runs before it never hit it. One mutex around all three
+  (`g_thread_name_mutex`, a few hundred name changes a session). After it: five measurement runs
+  and the later boots on the phone and a Linux run, no crash. The same code runs on every
+  platform, so Windows and Mac get the fix with the patch.
+- **Settings menu for fingers** (`menu.cpp`, phones only; the desktop layout is the same code as
+  before). At the desktop layout a checkbox was 2 mm across on the S23 FE. Now: one sheet under
+  the overlay's Menu button, two columns, rows 84 px high at 1080p (5.3 mm; text 36 px), preset
+  buttons as wide as their column, a Close button, a scroll bar wide enough to drag, combos and
+  sliders as wide as their column with the label above. Top level: presets, frame rate limit,
+  30 fps in vehicles, VSync, FPS counter, touch controls, **touch button size** (new, saved:
+  `gtav_touch_scale` 0.7-1.4), language, bug report; the rest under "Advanced". Checked on the
+  phone with screenshots and `input tap`: fits 2340x1080 without scrolling while Advanced is
+  closed. The iPhone gets the same layout (never built there: check it on the Mac).
+- **On-screen gamepad:** 1.1 by default on Android (the same physical size on a 6.4-inch screen
+  as the iPhone's 1.3 on 5.4 inches), Back / Menu / Start 20% larger and further apart (their hit
+  circles no longer overlap).
+- **Sound:** every measurement run passes `--audio_mute=true`, which zeroes the output after the
+  level meter. Those runs' own audio lines show the game's mix at normal levels with no late
+  frames ("0 of 1875 frames were silence", peaks -9 to -27 dB on the front channels, the centre
+  channel at -14 to -16 dB when someone speaks), and a session started with the default flags
+  (no mute) logs the same. Not checked by ear by the Linux session.
 
 ## Perf session 11-23: the game's CPU side (branch `android-cpu`, off `mt-record`)
 
