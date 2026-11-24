@@ -31,6 +31,7 @@
 #include <intrin.h>
 #include <shellapi.h>
 #elif defined(__APPLE__)
+#include <TargetConditionals.h>
 #include <sys/sysctl.h>
 #include <sys/utsname.h>
 #else
@@ -258,6 +259,8 @@ void ShowInFolder(const std::string& path) {
 #if defined(_WIN32)
   const std::wstring arg = L"/select,\"" + fs::path(path).wstring() + L"\"";
   ShellExecuteW(nullptr, L"open", L"explorer.exe", arg.c_str(), nullptr, SW_SHOWNORMAL);
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+  (void)path;  // no Finder on the iPhone (and no system()): the settings menu names the file
 #elif defined(__APPLE__)
   const std::string cmd = "open -R '" + path + "' >/dev/null 2>&1 &";
   std::system(cmd.c_str());
