@@ -118,4 +118,16 @@ compiled there. What it changes for them, on top of the list below:
   each inside the file's `.plt` section (arm64 jump stubs, `adrp x16 / ldr x17 / add x16 / br x17`
   per import; equal wherever two libraries' import tables sit at the same page offsets). No game
   content. Unpack the APK before scanning it: the scanner does not look into zip files.
-- Published with `Latest` left on v0.3.0 (the desktop packages are there); `main` not moved.
+- The standard scan alone (`scan_release.sh` on the unpacked APK, without the extra library):
+  **PASS, 0 failing**.
+- **Published** 2026-11-23 21:16 local: https://github.com/andrewnakas/gtav-recomp/releases/tag/v0.5.0-android,
+  tag at 0b08506 (51d0fea + documentation), `Latest` left on v0.3.0 (the desktop packages are
+  there), `main` not moved. Assets, both downloaded again and compared byte for byte:
+  `GTAV.apk` 0856e2fc8cfebc610b1af0ed52d3f3f9fe7ce3180ee8184de58cb6b7adfbe615,
+  `gtav-recomp-src-v0.5.0-android.tar.xz` f0b17693a2d4e19db1f0dad0f5e18281e8c4ad0fd9aa95cfe44aaedf9ce1cc9e
+  (`TMPDIR` on a disk for `make_source_archive.sh`: `/tmp` is RAM here).
+- The **draft `v0.5.0`** (not public, target `max-perf`) exists as the exchange point between the
+  machines and holds `android-v0.5.0.tar` (`dist/v0.5.0/android`: that APK + `LICENSES/`). The
+  Mac uploads `ios-shell-v0.5.0.tar` there (`docs/HANDOFF_MAC_2026-11-23.md`); then Linux can
+  finish `gtav-recomp-linux-x64.tar.gz` (compat build at the release commit, package with the
+  iOS shell, unattended install, scan).

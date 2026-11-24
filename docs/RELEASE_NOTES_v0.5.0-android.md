@@ -83,7 +83,6 @@ PC is no longer used.
 - **WASTED / BUSTED screen stuck above 30 fps (#21):** the death screen fades and you respawn at
   the hospital at any frame rate.
 - **Cutscene dialogue stopping partway (#3, #4):** speech plays to the end.
-- A crash at start when two threads named a new game thread at the same moment.
 
 ## Known issues
 

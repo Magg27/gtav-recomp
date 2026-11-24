@@ -25,9 +25,9 @@ So the Mac has two jobs:
 
 ## Where things stand
 
-- **Android 0.5.0 is published** as `v0.5.0-android` (owner's go, 11-23): the standalone
-  `GTAV.apk` that sets the game up on the phone, built from `max-perf` at that tag. `main` did not
-  move; `Latest` is still v0.3.0.
+- **Android 0.5.0 is published** as `v0.5.0-android` (owner's go, 11-23; tag at 0b08506): the
+  standalone `GTAV.apk` that sets the game up on the phone. `main` did not move; `Latest` is
+  still v0.3.0. What was checked for it: the end of `docs/RELEASE_v0.5.0.md`.
 - **Linux:** `max-perf` builds and runs (developer build). The Linux package is not made yet: it
   waits for the iPhone shell.
 - **Mac, iPhone, Windows: nothing after v0.3.0 was ever compiled there.** `max-perf` holds, on
