@@ -58,8 +58,10 @@ LICENSES = [
 FFMPEG_NOTICE_MACOS = FFMPEG_NOTICE.replace("rexruntimerd.dll", "librexruntime.dylib")
 
 # Libraries a shipped Mach-O may load: macOS's own, or ones in the package.
+# The Tracy profiler stays out of player builds (issue #18; the SDK option defaults off since
+# f7707d5): a runtime that still links libTracyClient.dylib fails check_macho below.
 PACKAGED_LIBS = {"@rpath/librexruntime.dylib", "@rpath/librexgpu-xenos.dylib",
-                 "@rpath/libTracyClient.dylib", "@rpath/libdxcompiler.dylib",
+                 "@rpath/libdxcompiler.dylib",
                  "@rpath/libvulkan.1.dylib", "@rpath/libMoltenVK.1.dylib",
                  "@rpath/gtav_game.dylib"}  # gtav_game.dylib: built by the installer
 
@@ -177,7 +179,6 @@ def main():
         (BUILD / "gtav_fast", "gtav_fast", True),
         (sdk_install / "lib" / "librexruntime.dylib", "librexruntime.dylib", True),
         (sdk_install / "lib" / "librexgpu-xenos.dylib", "librexgpu-xenos.dylib", True),
-        (sdk_install / "lib" / "libTracyClient.dylib", "libTracyClient.dylib", True),
         (sdk_install / "bin" / "rexglue", "rexglue", True),  # rpath @loader_path: librexruntime
         (sdk_install / "lib" / "libvulkan.1.dylib", "vulkan/lib/libvulkan.1.dylib", True),
         (sdk_install / "lib" / "libMoltenVK.dylib", "vulkan/lib/libMoltenVK.dylib", True),
@@ -212,7 +213,7 @@ def main():
     thin(pkg / "tools/shaders/lib/libdxcompiler.dylib")
     # libvulkan finds MoltenVK through the ICD manifest next to it (as in the dev build tree).
     subprocess.run(["strip", "-S", "-x"] + [str(pkg / f) for f in
-                    ("gtav_fast", "librexruntime.dylib", "librexgpu-xenos.dylib", "libTracyClient.dylib",
+                    ("gtav_fast", "librexruntime.dylib", "librexgpu-xenos.dylib",
                      "rexglue", "tools/shaders/XenosRecomp")], check=True, capture_output=True)
 
     ios_dir = None
