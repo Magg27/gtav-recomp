@@ -190,6 +190,90 @@ Not needed for the release, and each wants its own A/B on the Mac and the iPhone
 |---|---|---|---|
 | Linux (developer build) | 51d0fea | runs | hidden run-arounds clean; package waits for the iPhone shell |
 | Android (S23 FE) | 51d0fea | PASS | release APK, game built on the phone, see `docs/RELEASE_v0.5.0.md` |
-| Mac | | | |
-| iPhone | | | |
+| Mac (M1 Air, 8 GB) | 75fbe60 | unattended tests pass; owner's hands-on tests open | package on the draft; see "Mac and iPhone, 11-24" |
+| iPhone (13 mini) | 75fbe60 | ipa built by the Mac package and installed; **not played yet** | tests 11 and 12 open; shell tar not uploaded |
 | Windows | | | |
+
+### Mac and iPhone, 11-24
+
+MacBook Air M1, 8 GB, macOS 27.0.1, Xcode 27.1 (Apple clang 21). Written by the Claude session
+on the Mac. Every run was hidden and muted (`--gtav_native_hidden=true --audio_mute=true`), so
+nothing here was seen in a window or heard: tests 3, 4, 6, 11, 12 and the by-eye half of 7 are
+the owner's.
+
+Fixes pushed to `max-perf`:
+
+- `95f7f79` two link errors: `sub_83829CC0` / `sub_83829CD8` were still in `d3d_probe_list.inc`
+  (duplicate symbols where the probes are compiled in: macOS, Windows), and `bzero` was missing
+  from `libSystem.tbd` / `libSystem_ios.tbd` (Apple clang turns two zeroing loops into it).
+- `dce0198` `bug_report.cpp` called `system()`, which the iOS SDK refuses: the iPhone shell had
+  not compiled since v0.4.0.
+- `75fbe60` **xxHash read its input through a type-punned load** (its default for GCC/clang) and,
+  with `XXH_INLINE_ALL`, Apple clang moved the stores of a key's `RenderFormat` fields after the
+  hash. Clear pipelines of different colour formats shared one cache slot: Metal's validation
+  layer counted about 400 "pipeline's pixelFormat does not match the framebuffer's" a second in
+  play, and the frames after WASTED (only a clear) showed blue noise. Now
+  `XXH_FORCE_MEMORY_ACCESS=0` in the four files that include `xxhash.h`; 0 mismatches after.
+  **For the other machines:** the same `Hash(&local, sizeof)` pattern keys the pipeline,
+  framebuffer, stream and in-pass resolve caches, so every platform should build from this
+  commit or later and look again at anything that depended on those caches. Not tested: whether
+  PR #13's grey world with in-pass resolves on the Mac was this bug (the Mac launcher still sets
+  `GTAV_NATIVE_FETCH_RESOLVE=0`).
+- `9aba5e8` `make_release_macos.py` still packaged `libTracyClient.dylib`, which the SDK has not
+  built since f7707d5. `make_release_linux.py` still lists `libTracyClient.so` (not touched).
+
+| # | result | what was seen |
+|---|---|---|
+| 1 | pass | after `95f7f79`; codegen 811/811 in the developer build, the package install and `--iphone` |
+| 2 | pass | package: new game folder -> Display Calibration -> Story Mode -> prologue vault, lit; existing save -> Franklin's street, lit. A new game folder waits at Display Calibration for A / Enter: unattended runs need `--input_script` |
+| 3 | open | owner |
+| 4 | open | owner, by ear. Log meter only (muted runs): 181 of 187 ten-second reports had 0 silent frames, the rest 1-3 |
+| 5 | pass | after `75fbe60`: fade to black, respawn at the hospital, 46-49 fps, no noise in 111 captures. Before: blue noise for the ~10 s after WASTED |
+| 6 | open | owner (keyboard, mouse, F1 menu, fullscreen, Controls) |
+| 7 | half | #13: no grey world in any capture with the launcher's default. #14: the log shows a 2560x1440 swapchain at contents scale 2.0; "fills the window" needs eyes |
+| 8 | pass, no gain | no crash; captures with 1 and with 3 threads look right; table below |
+| 9 | pass | report zip written (developer build, `report` debug command; the menu row itself not clicked) |
+| 10 | pass | after `dce0198`; also built by `IOS_SHELL=1 build_release_macos.sh` |
+| 11 | open | `GTAV --iphone` from the package: 811/811, 3,617 shaders, 0 failed, `GTAV.ipa` 169 MB. Installed with `tools/ios/install_ipa_dev.sh` as 0.5.0 (202611232352); the phone's game data and save are in place. The phone was locked, so it was not started |
+| 12 | open | owner |
+| 13 | pass, copy stage not run | below |
+| 14 | PASS | `scan_release_macos.sh`: 1,326 files, 558 MB of sources, 0 failing |
+
+Test 13: `GTAV --unattended` from the unzipped zip, `GTAV_JOBS=2`. Codegen matched 811/811, the
+406 files compiled in 483 s, `gtav_game.dylib` linked, "Done. Press Play."; the launcher then
+started the game for both cases of test 2. **The copy stage did not run:** the internal disk has
+no room for the 15 GB, so the game folder's data files were links to an earlier install on the
+external drive, each hashed equal to `expected.txt` first and listed in `data/install_state.txt`
+(the installer's own list of files verified by an earlier run). Opening the discs, the
+verification review, codegen, compile, link and launch ran as for a player. Extracting the
+15 GB from the ISOs was **not** exercised with this build on the Mac.
+
+Test 8, "Record threads" against off inside one run (`--gtav_native_ab`, package build, existing
+save, Franklin's street, 6 to 10 reports of 1,200 frames each):
+
+| record threads | frame rate against off | render thread CPU per frame |
+|---|---|---|
+| 1 | -4.1% | 13.2 -> 11.4 ms |
+| 2 | -2.3% | 9.5 -> 8.1 ms |
+| 3 | -0.3% | 7.1 -> 5.1 ms |
+
+The render thread does less, the frame rate does not rise: leave it off on this Mac. Draws and
+passes per frame were equal on both sides (within the scene's own movement).
+
+Frame rates (hidden window, uncapped, other jobs running on the Mac): prologue vault about 55;
+Franklin's street 45-57 with 2,000-2,800 draws, 31-40 while another job held a core. Numbers in
+a visible window and the iPhone's are the owner's to take.
+
+Uploads to the draft `v0.5.0`:
+
+- `gtav-recomp-macos-arm64.zip`, 195,560,842 bytes, SHA-256
+  `e1d5e6f27f90401954e39b6533e1f41ff47f6ef030707f4d958cea27d1bf94e8`. Binaries built from
+  `75fbe60` with a clean tree; packaged by `9aba5e8`'s `make_release_macos.py`. Its `android/` is
+  the published `GTAV.apk` (SHA-256 `0856e2fc...e615`).
+- `ios-shell-v0.5.0.tar` is **not uploaded**: it waits for test 11. It is ready on the Mac
+  (`~/gtav05/out2`, the `ios/` folder from `build/release-mac/ios-shell-app` at `75fbe60`,
+  29,650,432 bytes, SHA-256 `8da291884bec40f501aa17951bb2a0048d16751e7b31950890311ea04eb4d957`).
+  The Mac zip's `ios/` holds the same binaries with the ad-hoc signatures `make_release_macos.py`
+  gives every Mach-O in the app, so they differ byte for byte from the tar's.
+
+Not done: the "After it passes" switches, PR #16.
