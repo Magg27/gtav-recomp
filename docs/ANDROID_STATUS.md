@@ -332,7 +332,20 @@ Fifth batch, same day (where the GPU's time goes, thread placement, fewer render
   (`ab_shots_diff.py`, 0 of 425 pairs out of range; in-world neighbours differ only where
   something is animated), fps and recording time inside the noise there. **Not measured on the
   phone yet** (it was not connected): `logs/phone_c3.sh` installs the build and runs the A/B, a
-  screenshot comparison, the GPU time by pass kind and the placement A/B again with the merge on.
+  screenshot comparison, the GPU time by pass kind and the placement A/B again with the merge on
+  (`bash logs/phone_c3.sh > logs/android/mpc3_phone.out 2>&1`, about 25 minutes; `logs/` is not
+  in the repository, the script is a dozen lines around `tools/android/ab.sh`).
+- **The reflection cube can be redrawn every Nth frame** (`gtav_native_cube_every`, live, 1 by
+  default: every frame). The game draws its 128x128 reflection cube map anew every frame: six
+  times "clear, 20-90 draws into a multisampled target, resolve into a cube face", ~345 draws and
+  2.3 of the phone's 25.4 ms of GPU time. On a frame that does not redraw it the renderer passes
+  over those clears, draws and resolves (found from the frame's command list: the unbroken run
+  on the resolve's source target before each resolve into a cube face that has been resolved
+  before), and the cube texture keeps the last redraw. What it costs: reflections on cars and
+  windows move at 1/N of the frame rate; standing still the picture is the same. Linux, same-run
+  A/B every frame | every other frame (`mp_cube_ab`): 1,600-1,650 -> 1,430-1,490 draws a frame,
+  175 -> 169 passes, recording 8.6 | 8.4, 8.5 | 8.0, 6.2 | 5.8, 8.4 | 7.4, 7.6 | 6.7 ms, same
+  picture in the screenshots. **Not measured on the phone yet** (step 5 of `logs/phone_c3.sh`).
 - The per-texture hash timers read the clock on the record profile's sampled frames only (every
   8th): 800-2,500 pairs of clock reads a frame were 2.5% of the record thread in `mpb9_prof`.
 - Measured on Linux and removed: the count of recorded draws that the GPU fences wait on moved

@@ -155,6 +155,10 @@ REXCVAR_DEFINE_BOOL(gtav_native_colorless, true, "GTAV",
 REXCVAR_DEFINE_BOOL(gtav_native_keep_targets, false, "GTAV",
                     "Draws into some of the bound pass's attachments (fewer colour targets, or no depth) keep the "
                     "pass and leave the others unwritten, instead of starting a pass with the smaller set (live)");
+REXCVAR_DEFINE_INT32(gtav_native_cube_every, 1, "GTAV",
+                     "Native renderer: the game redraws its reflection cube map (six multisampled faces) every "
+                     "frame. N > 1 redraws it every Nth frame and passes over its draws, clears and resolves on "
+                     "the others: reflections on cars and windows then move at 1/N of the frame rate (live)");
 REXCVAR_DEFINE_BOOL(gtav_native_depth_clamp, false, "GTAV", "Experiment: depth clamp instead of far/near clipping");
 REXCVAR_DEFINE_DOUBLE(gtav_native_depth_bias_scale, 1.0, "GTAV",
                       "Native renderer (diagnostic, live): multiplier on the constant part of the guest polygon "
@@ -1446,6 +1450,7 @@ struct ResolvedTexture {
   // Cube faces and mip levels (resolves with a destination level/face): 6 layers for cubes,
   // the fetch constant's mip count, one render view + framebuffer per written (face, level).
   uint32_t mips = 1, layers = 1;
+  uint32_t cube_faces = 0;       // bit per face that has been resolved into this texture (level 0)
   uint32_t fetch_words[6] = {};  // destination fetch constant of the last resolve
   std::unique_ptr<RenderTextureView> cube_view;
   uint32_t cube_descriptor = 0;
@@ -2513,6 +2518,51 @@ struct Backend::Impl {
   }
 
   uint32_t kept_targets = 0;  // draws that kept the bound pass's larger target set (--gtav_native_keep_targets)
+
+  // --gtav_native_cube_every. In the frame's command order the reflection cube is six times
+  // "clear, 20-90 draws into one multisampled colour target, resolve into a cube face". On a frame
+  // that does not redraw it those commands are marked here and Execute passes over them, so the
+  // cube texture keeps what the last redraw resolved (the guest memory behind it too: the
+  // write-back is part of the resolve). Only faces that have been resolved into the texture
+  // before, and only the unbroken run of draws and clears on the resolve's source target right
+  // before it: anything else in between (another resolve, a query) ends the run, and the draws
+  // before it are recorded as usual.
+  std::vector<uint8_t> skip_commands;  // per command of the frame; empty: none
+  uint32_t cube_skipped = 0;           // draws passed over (stats)
+  void MarkCubeSkips(const FramePacket& f) {
+    skip_commands.clear();
+    const int every = REXCVAR_GET(gtav_native_cube_every);
+    if (every <= 1 || frame % uint64_t(every) == 0) return;
+    for (size_t i = 0; i < f.commands.size(); i++) {
+      if (f.commands[i].kind != CommandKind::kResolve) continue;
+      const ResolveCommand& rc = f.resolves[f.commands[i].index];
+      const uint32_t source = rc.flags & 7;
+      const uint32_t* words = rc.dest_words + 7;
+      const uint32_t base = FetchBaseAddress(words) & 0x1FFFFFFF;
+      const uint32_t dw = (words[2] & 0x1FFF) + 1, dh = ((words[2] >> 13) & 0x1FFF) + 1;
+      if (source >= 4 || !base || ((words[5] >> 9) & 3) != 3 || dw != dh || rc.dest_level || rc.dest_face >= 6) continue;
+      const uint8_t* r = f.At(rc.regs);
+      const auto surface = regs::Surface(r);
+      if (!surface.msaa) continue;
+      auto latest = resolved_latest.find(base);
+      if (latest == resolved_latest.end()) continue;
+      auto have = resolved.find(latest->second);
+      if (have == resolved.end() || !have->second.texture || !(have->second.cube_faces >> rc.dest_face & 1)) continue;
+      const uint32_t target = regs::Color(r, int(source)).base;
+      auto same_target = [&](const uint8_t* rr) {
+        const auto there = regs::Surface(rr);
+        return there.pitch == surface.pitch && there.msaa == surface.msaa && regs::Color(rr, int(source)).base == target;
+      };
+      if (skip_commands.empty()) skip_commands.assign(f.commands.size(), 0);
+      skip_commands[i] = 1;
+      for (size_t j = i; j-- > 0;) {
+        const Command& c = f.commands[j];
+        if (c.kind == CommandKind::kDraw && same_target(f.At(f.draws[c.index].regs))) skip_commands[j] = 1;
+        else if (c.kind == CommandKind::kClear && same_target(f.At(f.clears[c.index].regs))) skip_commands[j] = 1;
+        else break;
+      }
+    }
+  }
   void PassBegin(const char* why) {
     if (pass_stats) pass_reasons[why]++;
     if (seqdiag) seq_passes += fmt::format("  [pass: {}]\n", why);
@@ -6486,7 +6536,9 @@ struct Backend::Impl {
       ZeroTexture(list, dst.texture.get(), dst_format, Sz(dw, s), Sz(dh, s), mips, layers);
       dst.descriptor = AllocDescriptor();
       texture_set->setTexture(dst.descriptor, dst.texture.get(), RenderTextureLayout::SHADER_READ, dst.view.get());
+      dst.cube_faces = 0;
     }
+    if (cube && rc.dest_level == 0) dst.cube_faces |= 1u << rc.dest_face;  // (MarkCubeSkips)
     uint32_t x1 = 0, y1 = 0, x2 = std::min(dw, src->width), y2 = std::min(dh, src->height);
     if (rc.has_rect) {
       x1 = rc.source_rect[0], y1 = rc.source_rect[1];
@@ -6815,8 +6867,17 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
     consts(n.ps_consts, n.ps_use);
   };
   size_t next_draw = 0;  // index in f.commands of the first kDraw after the current command
+  s.MarkCubeSkips(f);
   for (size_t ci = 0; ci < f.commands.size(); ci++) {
     const auto& c = f.commands[ci];
+    if (!s.skip_commands.empty() && s.skip_commands[ci]) {  // --gtav_native_cube_every
+      if (c.kind == CommandKind::kDraw) {
+        s.cur_draw = c.index + 1;
+        s.cube_skipped++;
+        if (!s.stream) DrawsRecorded(c.index + 1);  // its guest data will not be read
+      }
+      continue;
+    }
     switch (c.kind) {
       case CommandKind::kDraw:
         if (next_draw <= ci) next_draw = ci + 1;
@@ -6911,6 +6972,8 @@ RenderTexture* Backend::Execute(const FramePacket& f, RenderCommandList* list, u
       s.stat_copy_resolves = 0;
       if (s.kept_targets) REXLOG_INFO("[native]   draws that kept the bound pass's larger target set per frame: {:.1f}", s.kept_targets / n);
       s.kept_targets = 0;
+      if (s.cube_skipped) REXLOG_INFO("[native]   reflection cube draws passed over per frame: {:.1f}", s.cube_skipped / n);
+      s.cube_skipped = 0;
       {
         std::vector<std::pair<uint32_t, std::string>> v;
         for (auto& [k, c] : s.pass_reasons) v.emplace_back(c, k);
