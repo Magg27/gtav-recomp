@@ -8,6 +8,43 @@ Branch `perf-linux` (it contains all of `issue-fixes`). Version strings set in 0
 **Nothing is published until the owner says Mac and Windows passed and says to ship** (no tag, no
 push to `main`, no public release). The draft and its helper uploads are fine once the owner says go.
 
+## Android alone first: `v0.5.0-android` (owner, 2026-11-23)
+
+The owner asked on 11-23 to publish the standalone APK (no game code) as the 0.5 release without
+waiting for Mac and Windows. That release is the tag `v0.5.0-android` on branch `max-perf`
+(perf-linux + the multithreaded renderer + the Android CPU pass + the max-performance line), with
+`GTAV.apk` and `gtav-recomp-src-v0.5.0-android.tar.xz`. `main` does not move and `Latest` stays on
+v0.3.0 until the desktop packages ship; text: `docs/RELEASE_NOTES_v0.5.0-android.md`.
+
+Checked for it on Linux and the S23 FE (results at the end of this file): the release APK
+installed over the test build, the game built on the phone by the app, world reached, sound, the
+phone settings menu, taint scan of the unpacked APK.
+
+**The desktop and iPhone packages still wait for Mac and Windows**, and `max-perf` was never
+compiled there. What it changes for them, on top of the list below:
+
+1. Re-apply all patches: `rexglue-sdk-gtav-linux.patch` grew ~640 lines since a27ae72 (waits,
+   thread names, the name lock, codegen for non-argument locals, the pch template),
+   `plume-gtav.patch` ~300, `ffmpeg-gtav.patch` ~320 (XMA tables computed once). Rebuild the codegen
+   tool and the runtime.
+2. **All generated code changed again.** The manifest now also has `non_volatile_as_local`,
+   `non_argument_as_local` and `skip_lr` with 66 `share_registers` functions, and
+   `tools/release/expected.txt` has the gen lines for it (4548a94). Linux x86-64 and Android arm64
+   build and run it; Windows x86-64 and Apple arm64 have not compiled it. Check 811/811, a boot and
+   a long run-around before anything else.
+3. Off on Windows, macOS and iOS by build or by default, until tested there (each is a switch):
+   `REX_FP_SINGLE_MODE` (compile flag of the game code), `gtav_guest_irq_lock` (1 there),
+   `gtav_fence_block_after_us` (-1 there), `guest_poll_patience_us` (Android only),
+   `gtav_native_copy_resolves` and `gtav_android_record_cores` (Android only); the D3D call-count
+   probes stay compiled in there (`GTAV_D3D_PROBES`).
+4. On for everyone, so test it: several record threads and the single draw path
+   (`docs/HANDOFF_MT_RENDERER_2026-11-22.md`), the SDK's wait changes (`posix_alertable_sleep`,
+   `posix_wake_one`, `posix_wake_unlocked`: macOS and iOS use that file too),
+   `xma_kick_wakes_worker` and the shared XMA tables (listen to cutscene speech and radio),
+   game threads named by role, the thread-name lock.
+5. iPhone: the settings menu has a new phone layout (`GTAV_MENU_PHONE` in `menu.cpp`, uses
+   `touch::MenuButtonBottom`), checked on Android only. Build the shell and look at it.
+
 ## What changed for every platform
 
 1. **Generated code changed.** `gtav/gtav_manifest.toml` now has `ctr_as_local`, `xer_as_local`,
@@ -56,3 +93,29 @@ push to `main`, no public release). The draft and its helper uploads are fine on
   APK 173 MB (`dist/v0.5.0/android`).
 - Left: full on-phone install + build + play on the S23 FE; package tarball after the iOS shell;
   unattended install from the unpacked tarball; `scan_release.sh` (include the APK's new tools).
+
+## `v0.5.0-android`: what was checked (2026-11-23, Linux + S23 FE)
+
+- **APK** `dist/v0.5.0/android/GTAV.apk` (`tools/android/make_shell.sh`, built at 51d0fea):
+  180,475,225 bytes, SHA-256 0856e2fc8cfebc610b1af0ed52d3f3f9fe7ce3180ee8184de58cb6b7adfbe615,
+  versionCode 5 / 0.5.0, not debuggable, shell `libgtav_fast.so` 0e816729..., signed with the same
+  certificate as the 0.3.0 APK (SHA-256 3b070344...b33231b1), so it installs over it.
+- **Game built on the phone by the app.** Release APK installed over the test build with the
+  game stamp (`files/game.txt`) removed, which is what an update from 0.3.0 looks like to the
+  app ("The game is not built yet. Press Install."). Codegen 4.5 minutes, "Generated code
+  matches the reference build (811 files)", 406 files compiled 6 at a time and linked: 14 min
+  48 s from the tap to the game's first log line, battery 40-42 C. The app started the game;
+  open world reached. Log: the one known `gamecache:\data\gta5_cache_x.dat` line per boot,
+  nothing else; the audio lines show the mix with no late frames.
+- **Settings menu and touch buttons** checked on the phone with a test APK holding the same
+  shell (same hash): screenshots, Advanced opened by a tap, the scroll bar dragged.
+- **Not run again with this APK:** the copy and check of the disc images (`install.cpp` changed
+  only in the compile flags since the on-phone install of 11-22), and no other phone model.
+- **Taint scan** of the unpacked APK (kit.zip unpacked too, 744 files): against the standard
+  sources (`scan_release.sh`, generated code of this manifest in `build/mp/gen_and`) plus a
+  cross-built `libgtav_game.so`. Everything is short boilerplate runs except two findings, both
+  against that library only: `libgtav_setup.so` 376 bytes and `libxenosrecomp_exe.so` 1,464 bytes,
+  each inside the file's `.plt` section (arm64 jump stubs, `adrp x16 / ldr x17 / add x16 / br x17`
+  per import; equal wherever two libraries' import tables sit at the same page offsets). No game
+  content. Unpack the APK before scanning it: the scanner does not look into zip files.
+- Published with `Latest` left on v0.3.0 (the desktop packages are there); `main` not moved.
