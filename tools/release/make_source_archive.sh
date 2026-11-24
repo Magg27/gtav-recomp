@@ -65,6 +65,15 @@ LLVM (clang, lld) and the DirectX Shader Compiler are bundled unmodified from th
 releases (LLVM 19.1.5 on Windows and Linux, 19.1.7 on macOS: github.com/llvm/llvm-project; dxc:
 XenosRecomp/thirdparty/dxc-bin).
 
+Android (GTAV.apk): librexruntime.so inside the APK is this SDK built for arm64 Android by
+gtav-recomp/tools/android/build_sdk.sh, with FFmpeg linked statically as above. To use a modified
+FFmpeg: change it, run build_sdk.sh, then build_game.sh with -DGTAV_GAME_DLL=ON (the shell) and
+RELEASE=1 build_apk.sh, all in gtav-recomp/tools/android (docs/ANDROID_STATUS.md lists the steps).
+The APK's clang, lld and dxc are built from the unmodified sources of LLVM 19.1.5 and
+DirectXShaderCompiler 416fab6b by tools/android/build_llvm.sh and build_dxc.sh, XenosRecomp from
+the tree in this archive by build_xr.sh; SDL comes from rexglue-sdk/thirdparty with
+gtav-recomp/sdl3-gtav.patch.
+
 No game data is in this archive or in the release.
 EOF
 tar -C "$work" -cf - "$top" | xz -T0 -6 -c > "$out"
