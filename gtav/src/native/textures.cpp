@@ -11,6 +11,7 @@
 #include <rex/kernel.h>
 #include <rex/system.h>
 
+#define XXH_FORCE_MEMORY_ACCESS 0  // memcpy reads: the default breaks type aliasing (see backend.cpp)
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 

@@ -22,6 +22,14 @@
 #include <rex/logging.h>
 #include <rex/system.h>
 
+// xxHash reads its input with memcpy (method 0). Its default for GCC/clang (method 1) loads 64-bit
+// words through an aligned(1) typedef that is not may_alias, and with XXH_INLINE_ALL the compiler
+// sees those loads next to the stores that build a hashed key. Apple clang then moved the stores of
+// `RenderFormat formats[4]` (an enum type, so a different type to the loads) after the hash in
+// ClearAttachment: targets of different colour formats shared one clear pipeline (Metal: "the
+// render pipeline's pixelFormat does not match the framebuffer's"), and a frame made only of a
+// clear (the fade after WASTED) showed blue noise. memcpy is a plain load on arm64 and x86-64.
+#define XXH_FORCE_MEMORY_ACCESS 0
 #define XXH_INLINE_ALL
 #include <imgui.h>
 #include <xxhash.h>
