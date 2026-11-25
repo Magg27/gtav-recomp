@@ -288,3 +288,38 @@ Neither crashed or changed the picture's draw counts in 4 minutes. On the Mac th
 makes no difference to the frame rate; blocking in the fence wait costs nothing and saves about
 half a core, as on Linux and Android. Not done: `REX_FP_SINGLE_MODE`, anything on the iPhone,
 PR #16.
+
+### iPhone played, PR #49, taint scan (11-24 evening)
+
+**The owner played the 0.5.0 ipa on the 13 mini: "runs slow, a lot of graphical glitches".** From
+the phone's log: the first launch after the update compiled every pipeline again (all shaders
+changed since 0.3.0). The frame's own compiles (six threads) took 1.5-3.5 s each, against
+0.3-0.5 s on the M1 Air, while the four warm-up threads were busy with the 2,644 pipelines of
+earlier runs. Draws were skipped for 95 s after the world appeared, up to 1,446 of about 2,600 a
+frame. A phone holds the previous frame for only 0.5 s, so the player saw missing geometry. The
+frame rate was 15-18 during that window and 26-30 (the cap) after. On the second launch, draws
+were missing for about 25 s. Steady state matches 0.3.0 (23 fps in the city in November; the GPU
+frame is now 23 ms against 33). On 11-01, the first iPhone day, the same storm skipped draws in
+13,322 frames. No errors, failed shaders or memory trouble in either launch. The settings menu
+works (the owner changed the frame cap, vsync and penumbra between launches).
+
+Proposed fix, **local, not pushed until it is measured on the phone**: the iPhone's warm-up
+threads drop to `QOS_CLASS_UTILITY` and start no compile while one of the frame's is queued or
+running. Other platforms get only the counter. The test is an A/B on the phone from the
+pre-update caches (pipeline files restored, Metal cache emptied); it waits for the phone to be
+unlocked.
+
+**PR #49** (a tester's M4: fullscreen hotkeys toggled twice; packager needed Tracy): the
+fullscreen fix is real (Option+Enter / F11 never changed fullscreen on macOS or Linux), but as
+sent it does not compile for iPhone or Android (`use of undeclared identifier 'sdk_window_id_'`:
+the window ids are desktop-only). The owner: if it breaks, leave it out. A version guarded for
+the phones builds for macOS and passes an iPhone `-fsyntax-only` check. It sits on a local
+branch and goes into the Mac package only if that package boots. The packager half is
+`9aba5e8` already. The PR is not merged, commented on or closed.
+
+**Taint scan:** the WD drive dropped out during a scan of a repackaged Mac zip, `update.rpf` was
+not read ("496 MB scanned" instead of 558) and the scan still printed PASS. `taint_scan.py` now
+fails on a source that is missing, unreadable or yields nothing. **Linux:** `scan_release.sh`'s
+default GENERATED_DIR (`~/gtav-e2e-linux-cg/generated/default`) does not exist on the 4050, so
+pass it explicitly or the scan now stops there. That repackaged zip was not uploaded; the draft
+still holds the `75fbe60` zip.
