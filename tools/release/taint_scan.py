@@ -145,12 +145,23 @@ def content_length(data, a, n):
 CONTROL_EXT = {".dll", ".exe", ".lib", ".cpp", ".h", ".hpp", ".c", ".inc", ".inja"}
 
 
-def walk(p, exts=SOURCE_EXT):
+def unread(path, e):
+    sys.exit(f"FAIL: cannot read {path} ({e.strerror or e}): a source that is not read would pass as clean")
+
+
+def walk(p, exts=SOURCE_EXT, strict=False):
+    # strict (the sources): a path that is missing or stops answering ends the scan. is_file() and
+    # os.walk() both treat such a path as an empty folder, and the scan then passed without it.
     p = Path(p)
+    if strict:
+        try:
+            os.stat(p)
+        except OSError as e:
+            unread(p, e)
     if p.is_file():
         yield p
     else:
-        for root, _, files in os.walk(p):
+        for root, _, files in os.walk(p, onerror=(lambda e: unread(e.filename or p, e)) if strict else None):
             for f in files:
                 q = Path(root) / f
                 if q.suffix.lower() in exts:
@@ -213,10 +224,14 @@ def main():
     scanned = 0
     for src in sources:
         print(f"  scanning {src}", flush=True)
-        for p in walk(src):
+        before = scanned
+        for p in walk(src, strict=True):
             if p.name in SDK_TEMPLATE_FILES:
                 continue
-            data = p.read_bytes()
+            try:
+                data = p.read_bytes()
+            except OSError as e:
+                unread(p, e)
             scanned += len(data)
             hs, offs = window_hashes(data)
             keep = offs >= spirv_preamble(data)
@@ -245,6 +260,8 @@ def main():
                 short[rp] = short.get(rp, 0) + 1
                 if n > longest.get(rp, (0,))[0]:
                     longest[rp] = (n, a, p, b)
+        if scanned == before:
+            sys.exit(f"FAIL: nothing to scan in {src} (wrong path or an empty folder?)")
     print(f"sources: {scanned / 2**20:.0f} MB scanned")
     for rp, (n, a, p, b) in sorted(longest.items()):
         line = (f"{rp.relative_to(rel)}: {short[rp]} matching windows, longest run {n} bytes "
