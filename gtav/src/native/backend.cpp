@@ -152,6 +152,9 @@ REXCVAR_DEFINE_INT32(gtav_native_texture_budget_mb, 1024, "GTAV",
 #if GTAV_MOBILE
 #define GTAV_BUFFER_BUDGET_DEFAULT 96
 #define GTAV_LOW_MEMORY_DEFAULT 600
+#elif defined(__linux__) && !defined(__ANDROID__)
+#define GTAV_BUFFER_BUDGET_DEFAULT 512
+#define GTAV_LOW_MEMORY_DEFAULT 0
 #else
 #define GTAV_BUFFER_BUDGET_DEFAULT 0
 #define GTAV_LOW_MEMORY_DEFAULT 0
